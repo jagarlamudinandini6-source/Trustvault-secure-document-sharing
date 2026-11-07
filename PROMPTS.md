@@ -89,3 +89,26 @@ This file documents the AI-assisted development process for TrustVault, includin
 - The related entries point to the real initial application commit because the core implementation was committed together.
 - No separate or fabricated commit history is claimed.
 - Additional improvements and deployment work will be documented as they are completed.
+### 2026-11-07 – Document deletion, permission revocation, and logout improvements
+
+**Prompt / Request:**  
+Enhance TrustVault so document owners can delete uploaded documents and revoke previously granted VIEW or DOWNLOAD permissions. Also fix manual logout so the page reloads after logout.
+
+**AI/tool output:**  
+- Added owner-only document deletion.
+- Added an API to list document permissions.
+- Added an API to revoke a user's document access.
+- Recorded document deletion and access revocation in audit logs.
+- Updated manual logout handling to reload the page after a user clicks Logout.
+
+**Issue encountered:**  
+The manual logout page was not reloading. The Logout button passed a React click event to the logout handler, causing the reload condition to behave incorrectly.
+
+**Alternative / Resolution:**  
+Changed the button handler from `onClick={handleLogout}` to `onClick={() => handleLogout()}`. This allowed manual logout to work while preserving the automatic inactivity timeout behavior.
+
+**Testing:**  
+Verified document deletion, permission management, audit-log updates, and manual logout. Automatic 15-minute timeout had also been tested.
+
+**Commit link:**  
+https://github.com/jagarlamudinandini6-source/Trustvault-secure-document-sharing/commit/efcf77e09ed224192124ae84c3dad17c2d772c7f
