@@ -1,0 +1,19 @@
+# Dependencies
+node_modules/
+
+# Environment secrets
+.env
+.env.*
+
+# Private uploaded documents
+backend/uploads/
+
+# Logs
+*.log
+
+# Frontend build files
+frontend/dist/
+
+# Backend build files
+backend/dist/
+test.txt
