@@ -132,6 +132,38 @@ IF NOT EXISTS (
     ON dbo.AuditLogs(DocumentId, OccurredAt);
 GO
 
+
+-- 5. SERVER-SIDE LOGIN SESSIONS
+-- Safe to run again: existing tables and data are not replaced.
+IF OBJECT_ID('dbo.Sessions', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.Sessions (
+        SessionId UNIQUEIDENTIFIER NOT NULL PRIMARY KEY,
+        UserId INT NOT NULL,
+        CreatedAt DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
+        LastActivityAt DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
+        ExpiresAt DATETIME2 NOT NULL,
+        RevokedAt DATETIME2 NULL,
+        IpAddress VARCHAR(45) NULL,
+        UserAgent NVARCHAR(512) NULL,
+
+        CONSTRAINT FK_Sessions_Users
+        FOREIGN KEY (UserId) REFERENCES dbo.Users(UserId)
+    );
+END;
+GO
+
+IF NOT EXISTS (
+    SELECT 1 FROM sys.indexes
+    WHERE name = 'IX_Sessions_UserId_ExpiresAt'
+      AND object_id = OBJECT_ID('dbo.Sessions')
+)
+BEGIN
+    CREATE INDEX IX_Sessions_UserId_ExpiresAt
+    ON dbo.Sessions(UserId, ExpiresAt);
+END;
+GO
+
 -- VERIFY TABLES
 SELECT TABLE_NAME
 FROM INFORMATION_SCHEMA.TABLES

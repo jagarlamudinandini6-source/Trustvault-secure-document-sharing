@@ -639,6 +639,291 @@ router.post("/:id/share", async (req, res) => {
 });
 
 
+
+// DELETE A DOCUMENT (OWNER ONLY).
+// Soft-delete the database record, remove its permissions, and delete the stored file.
+// Keeping the row preserves the document's audit history.
+router.delete("/:id", async (req, res) => {
+  try {
+    const documentId = req.params.id;
+    const uuidPattern =
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+    if (!uuidPattern.test(documentId)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid document ID."
+      });
+    }
+
+    const pool = await getPool();
+    const documentResult = await pool.request()
+      .input("DocumentId", sql.UniqueIdentifier, documentId)
+      .query(`
+        SELECT DocumentId, OwnerId, StoredFileName, OriginalFileName
+        FROM dbo.Documents
+        WHERE DocumentId = @DocumentId
+          AND IsDeleted = 0
+      `);
+
+    const document = documentResult.recordset[0];
+    if (!document) {
+      return res.status(404).json({
+        success: false,
+        message: "Document not found."
+      });
+    }
+
+    if (document.OwnerId !== req.user.userId) {
+      await writeAudit(
+        pool.request(),
+        req,
+        document.DocumentId,
+        "DOCUMENT_DELETE",
+        "DENIED",
+        "Unauthorized attempt to delete a document."
+      );
+      return res.status(403).json({
+        success: false,
+        message: "Only the document owner can delete it."
+      });
+    }
+
+    const transaction = new sql.Transaction(pool);
+    await transaction.begin();
+
+    try {
+      await new sql.Request(transaction)
+        .input("DocumentId", sql.UniqueIdentifier, documentId)
+        .query(`
+          UPDATE dbo.Documents
+          SET IsDeleted = 1
+          WHERE DocumentId = @DocumentId
+            AND IsDeleted = 0;
+
+          DELETE FROM dbo.DocumentPermissions
+          WHERE DocumentId = @DocumentId;
+        `);
+
+      await writeAudit(
+        new sql.Request(transaction),
+        req,
+        document.DocumentId,
+        "DOCUMENT_DELETED",
+        "SUCCESS",
+        `Owner deleted document "${document.OriginalFileName}". All shared permissions were removed.`
+      );
+
+      await transaction.commit();
+    } catch (error) {
+      await transaction.rollback().catch(() => {});
+      throw error;
+    }
+
+    const filePath = path.resolve(
+      UPLOAD_DIR,
+      path.basename(document.StoredFileName)
+    );
+    if (filePath.startsWith(UPLOAD_DIR + path.sep)) {
+      await fs.unlink(filePath).catch((error) => {
+        if (error.code !== "ENOENT") {
+          console.error("Deleted document file cleanup failed:", error);
+        }
+      });
+    }
+
+    return res.json({
+      success: true,
+      message: "Document deleted successfully."
+    });
+  } catch (error) {
+    console.error("Document deletion error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Unable to delete document."
+    });
+  }
+});
+
+// LIST CURRENT SHARED PERMISSIONS (OWNER ONLY).
+router.get("/:id/permissions", async (req, res) => {
+  try {
+    const documentId = req.params.id;
+    const uuidPattern =
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+    if (!uuidPattern.test(documentId)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid document ID."
+      });
+    }
+
+    const pool = await getPool();
+    const ownerResult = await pool.request()
+      .input("DocumentId", sql.UniqueIdentifier, documentId)
+      .query(`
+        SELECT OwnerId
+        FROM dbo.Documents
+        WHERE DocumentId = @DocumentId
+          AND IsDeleted = 0
+      `);
+
+    const document = ownerResult.recordset[0];
+    if (!document) {
+      return res.status(404).json({
+        success: false,
+        message: "Document not found."
+      });
+    }
+
+    if (document.OwnerId !== req.user.userId) {
+      return res.status(403).json({
+        success: false,
+        message: "Only the document owner can manage access."
+      });
+    }
+
+    const result = await pool.request()
+      .input("DocumentId", sql.UniqueIdentifier, documentId)
+      .query(`
+        SELECT
+          p.UserId,
+          u.FullName,
+          u.Email,
+          p.CanView,
+          p.CanDownload,
+          p.GrantedAt
+        FROM dbo.DocumentPermissions p
+        INNER JOIN dbo.Users u ON u.UserId = p.UserId
+        WHERE p.DocumentId = @DocumentId
+        ORDER BY u.Email
+      `);
+
+    return res.json({
+      success: true,
+      permissions: result.recordset
+    });
+  } catch (error) {
+    console.error("Document permission list error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Unable to retrieve document permissions."
+    });
+  }
+});
+
+// REVOKE ALL SHARED PERMISSIONS FOR ONE USER (OWNER ONLY).
+router.delete("/:id/permissions/:userId", async (req, res) => {
+  try {
+    const documentId = req.params.id;
+    const targetUserId = Number(req.params.userId);
+    const uuidPattern =
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+    if (!uuidPattern.test(documentId) ||
+        !Number.isSafeInteger(targetUserId) ||
+        targetUserId <= 0) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid document or user ID."
+      });
+    }
+
+    const pool = await getPool();
+    const documentResult = await pool.request()
+      .input("DocumentId", sql.UniqueIdentifier, documentId)
+      .query(`
+        SELECT DocumentId, OwnerId, OriginalFileName
+        FROM dbo.Documents
+        WHERE DocumentId = @DocumentId
+          AND IsDeleted = 0
+      `);
+
+    const document = documentResult.recordset[0];
+    if (!document) {
+      return res.status(404).json({
+        success: false,
+        message: "Document not found."
+      });
+    }
+
+    if (document.OwnerId !== req.user.userId) {
+      await writeAudit(
+        pool.request(),
+        req,
+        document.DocumentId,
+        "DOCUMENT_ACCESS_REVOKE",
+        "DENIED",
+        "Unauthorized attempt to revoke document access."
+      );
+      return res.status(403).json({
+        success: false,
+        message: "Only the document owner can revoke access."
+      });
+    }
+
+    const targetResult = await pool.request()
+      .input("DocumentId", sql.UniqueIdentifier, documentId)
+      .input("TargetUserId", sql.Int, targetUserId)
+      .query(`
+        SELECT p.UserId, u.Email
+        FROM dbo.DocumentPermissions p
+        INNER JOIN dbo.Users u ON u.UserId = p.UserId
+        WHERE p.DocumentId = @DocumentId
+          AND p.UserId = @TargetUserId
+      `);
+
+    const target = targetResult.recordset[0];
+    if (!target) {
+      return res.status(404).json({
+        success: false,
+        message: "This user does not currently have access to the document."
+      });
+    }
+
+    const transaction = new sql.Transaction(pool);
+    await transaction.begin();
+
+    try {
+      await new sql.Request(transaction)
+        .input("DocumentId", sql.UniqueIdentifier, documentId)
+        .input("TargetUserId", sql.Int, targetUserId)
+        .query(`
+          DELETE FROM dbo.DocumentPermissions
+          WHERE DocumentId = @DocumentId
+            AND UserId = @TargetUserId
+        `);
+
+      await writeAudit(
+        new sql.Request(transaction),
+        req,
+        document.DocumentId,
+        "DOCUMENT_ACCESS_REVOKED",
+        "SUCCESS",
+        `Access to "${document.OriginalFileName}" revoked for ${target.Email}.`
+      );
+
+      await transaction.commit();
+    } catch (error) {
+      await transaction.rollback().catch(() => {});
+      throw error;
+    }
+
+    return res.json({
+      success: true,
+      message: "Document access revoked successfully.",
+      revokedUser: target.Email
+    });
+  } catch (error) {
+    console.error("Document permission revocation error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Unable to revoke document access."
+    });
+  }
+});
+
 // GET ACTIVITY LOGS FOR THE LOGGED-IN USER
 router.get("/audit", async (req, res) => {
   try {

@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import "./App.css";
 
 const menuItems = [
@@ -246,6 +246,118 @@ function App() {
     }
   };
 
+  // Delete a document. The backend verifies that the current user owns it.
+  const deleteDocument = async (doc) => {
+    const confirmed = window.confirm(
+      `Are you sure you want to delete "${doc.name}"? This will remove access for everyone.`
+    );
+    if (!confirmed) return;
+
+    const token = sessionStorage.getItem("trustvault_token");
+    if (!token) {
+      alert("Please log in again.");
+      return;
+    }
+
+    try {
+      const response = await fetch(
+        `http://127.0.0.1:5000/api/documents/${encodeURIComponent(doc.id)}`,
+        {
+          method: "DELETE",
+          headers: { Authorization: `Bearer ${token}` },
+        }
+      );
+      const data = await response.json();
+      if (!response.ok || !data.success) {
+        throw new Error(data.message || "Unable to delete document.");
+      }
+
+      await loadDocuments(token);
+      await loadAuditLogs(token);
+      alert("Document deleted successfully.");
+    } catch (error) {
+      alert(error.message || "Unable to delete document.");
+    }
+  };
+
+  // Show current permissions and let the owner revoke one user's access.
+  const manageAccess = async (doc) => {
+    const token = sessionStorage.getItem("trustvault_token");
+    if (!token) {
+      alert("Please log in again.");
+      return;
+    }
+
+    try {
+      const response = await fetch(
+        `http://127.0.0.1:5000/api/documents/${encodeURIComponent(doc.id)}/permissions`,
+        {
+          headers: { Authorization: `Bearer ${token}` },
+        }
+      );
+      const data = await response.json();
+      if (!response.ok || !data.success) {
+        throw new Error(data.message || "Unable to load document permissions.");
+      }
+
+      const permissions = data.permissions || [];
+      if (permissions.length === 0) {
+        alert("This document is not currently shared with anyone.");
+        return;
+      }
+
+      const accessList = permissions
+        .map((item, index) =>
+          `${index + 1}. ${item.FullName} (${item.Email}) — ${
+            item.CanView && item.CanDownload
+              ? "View + Download"
+              : item.CanView
+                ? "View only"
+                : item.CanDownload
+                  ? "Download"
+                  : "No access"
+          }`
+        )
+        .join("\n");
+
+      const selectedEmail = window.prompt(
+        `Current access for "${doc.name}":\n\n${accessList}\n\nEnter the exact email address of the user whose access you want to revoke:`
+      );
+      if (!selectedEmail || !selectedEmail.trim()) return;
+
+      const selected = permissions.find(
+        (item) => item.Email.toLowerCase() === selectedEmail.trim().toLowerCase()
+      );
+      if (!selected) {
+        alert("That email address is not in this document's access list.");
+        return;
+      }
+
+      const confirmed = window.confirm(
+        `Revoke all access to "${doc.name}" for ${selected.Email}?`
+      );
+      if (!confirmed) return;
+
+      const revokeResponse = await fetch(
+        `http://127.0.0.1:5000/api/documents/${encodeURIComponent(doc.id)}/permissions/${selected.UserId}`,
+        {
+          method: "DELETE",
+          headers: { Authorization: `Bearer ${token}` },
+        }
+      );
+      const revokeData = await revokeResponse.json();
+      if (!revokeResponse.ok || !revokeData.success) {
+        throw new Error(revokeData.message || "Unable to revoke access.");
+      }
+
+      await loadDocuments(token);
+      await loadAuditLogs(token);
+      alert(`Access revoked for ${selected.Email}.`);
+    } catch (error) {
+      alert(error.message || "Unable to manage document access.");
+    }
+  };
+
   // Login or register through the backend API.
   const handleSubmit = async (event) => {
     event.preventDefault();
@@ -308,19 +420,121 @@ function App() {
     }
   };
 
-  const handleLogout = () => {
+  const handleLogout = async (reason = "") => {
+    const token = sessionStorage.getItem("trustvault_token");
+
+    // Revoke the server session before reloading. If the backend is
+    // temporarily unavailable, still complete the local logout.
+    if (token) {
+      try {
+        await fetch("http://127.0.0.1:5000/api/auth/logout", {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${token}`,
+          },
+        });
+      } catch (error) {
+        console.error("Server logout request failed:", error);
+      }
+    }
+
     sessionStorage.removeItem("trustvault_token");
     setLoggedIn(false);
     setCurrentUser(null);
     setEmail("");
     setPasswordPlaceholder("");
     setIsRegister(false);
-    setMessage("");
+    setMessage(reason);
     setDocuments([]);
     setAuditLogs([]);
     setAuditError("");
     setActivePage("Dashboard");
+
+    // Reload only for a user-clicked logout. The inactivity timeout passes
+    // a reason message and keeps the login screen message visible.
+    if (!reason) {
+      window.location.reload();
+    }
   };
+
+  // Keep the latest logout function available to the idle timer without
+  // restarting the timer every time the component renders.
+  const logoutHandlerRef = useRef(handleLogout);
+  logoutHandlerRef.current = handleLogout;
+
+  // Log out after 15 minutes without user interaction. Activity is sent to
+  // the backend at most once per minute so its server-side expiry also moves.
+  useEffect(() => {
+    if (!loggedIn) return undefined;
+
+    const IDLE_TIMEOUT_MS = 15 * 60 * 1000;
+    const ACTIVITY_SYNC_INTERVAL_MS = 5 * 1000;
+
+    let idleTimer;
+    let lastActivitySync = 0;
+    let loggingOut = false;
+
+    const expireSession = () => {
+      if (loggingOut) return;
+      loggingOut = true;
+      logoutHandlerRef.current?.(
+        "You were logged out after 15 minutes of inactivity. Please log in again."
+      );
+    };
+
+    const resetIdleTimer = () => {
+      window.clearTimeout(idleTimer);
+      idleTimer = window.setTimeout(expireSession, IDLE_TIMEOUT_MS);
+
+      const now = Date.now();
+      if (now - lastActivitySync < ACTIVITY_SYNC_INTERVAL_MS) return;
+
+      lastActivitySync = now;
+      const token = sessionStorage.getItem("trustvault_token");
+      if (!token) {
+        expireSession();
+        return;
+      }
+
+      fetch("http://127.0.0.1:5000/api/auth/activity", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+        },
+      })
+        .then((response) => {
+          if (response.status === 401) {
+            expireSession();
+          }
+        })
+        .catch((error) => {
+          console.error("Session activity update failed:", error);
+        });
+    };
+
+    const activityEvents = [
+      "mousemove",
+      "mousedown",
+      "keydown",
+      "scroll",
+      "touchstart",
+      "click",
+    ];
+
+    activityEvents.forEach((eventName) => {
+      window.addEventListener(eventName, resetIdleTimer, { passive: true });
+    });
+
+    // Start the timer and synchronize the session when the dashboard opens.
+    resetIdleTimer();
+
+    return () => {
+      window.clearTimeout(idleTimer);
+      activityEvents.forEach((eventName) => {
+        window.removeEventListener(eventName, resetIdleTimer);
+      });
+    };
+  }, [loggedIn]);
 
   // Upload selected files to the protected backend endpoint.
   const handleFileUpload = async (event) => {
@@ -417,9 +631,17 @@ function App() {
                 Download
               </button>
               {Number(doc.ownerId) === Number(currentUser?.userId) && (
-                <button type="button" onClick={() => shareDocument(doc)}>
-                  Share
-                </button>
+                <>
+                  <button type="button" onClick={() => shareDocument(doc)}>
+                    Share
+                  </button>
+                  <button type="button" onClick={() => manageAccess(doc)}>
+                    Manage Access
+                  </button>
+                  <button type="button" onClick={() => deleteDocument(doc)}>
+                    Delete
+                  </button>
+                </>
               )}
             </div>
           </div>
@@ -544,7 +766,7 @@ function App() {
           ))}
         </nav>
 
-        <button className="logout-button" onClick={handleLogout}>
+        <button className="logout-button" onClick={() => handleLogout()}>
           ⇥ Logout
         </button>
       </aside>
@@ -776,12 +998,11 @@ function App() {
               </div>
               <div className="settings-row">
                 <span>Authentication</span>
-                <strong>JWT authenticated</strong>
+                <strong>JWT + 15-minute inactivity session</strong>
               </div>
             </section>
           )}
         </div>
-
         <footer className="dashboard-footer">
           © 2026 TrustVault · Secure Document Management Platform
           <span>Secure workspace</span>

@@ -1,27 +1,49 @@
-
 const express = require("express");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
+const crypto = require("crypto");
 const { sql, getPool } = require("../database");
+const authenticateToken = require("../middleware/auth");
 
 const router = express.Router();
 
-// Generate authentication token
-function generateToken(user) {
+const IDLE_TIMEOUT_MINUTES = 15;
+const JWT_MAX_LIFETIME = "12h";
+
+// Create a server-side session and return its signed token.
+async function createSession(user, req) {
   const secret = process.env.JWT_SECRET;
 
   if (!secret) {
     throw new Error("JWT_SECRET is missing from .env");
   }
 
+  const sessionId = crypto.randomUUID();
+  const pool = await getPool();
+
+  await pool.request()
+    .input("SessionId", sql.UniqueIdentifier, sessionId)
+    .input("UserId", sql.Int, user.UserId)
+    .input("IpAddress", sql.VarChar(45), String(req.ip || "").slice(0, 45))
+    .input("UserAgent", sql.NVarChar(512), String(req.get("user-agent") || "").slice(0, 512))
+    .query(`
+      INSERT INTO dbo.Sessions
+        (SessionId, UserId, LastActivityAt, ExpiresAt, IpAddress, UserAgent)
+      VALUES
+        (@SessionId, @UserId, SYSUTCDATETIME(),
+         DATEADD(MINUTE, ${IDLE_TIMEOUT_MINUTES}, SYSUTCDATETIME()),
+         @IpAddress, @UserAgent)
+    `);
+
   return jwt.sign(
     {
       userId: user.UserId,
       email: user.Email,
-      role: user.Role
+      role: user.Role,
+      sessionId
     },
     secret,
-    { expiresIn: "1h" }
+    { expiresIn: JWT_MAX_LIFETIME }
   );
 }
 
@@ -84,7 +106,7 @@ router.post("/register", async (req, res) => {
       .input("Email", sql.NVarChar(255), email)
       .input("PasswordHash", sql.NVarChar(255), passwordHash)
       .query(`
-        INSERT INTO dbo.USERS
+        INSERT INTO dbo.Users
           (FullName, Email, PasswordHash)
         OUTPUT
           INSERTED.UserId,
@@ -96,7 +118,7 @@ router.post("/register", async (req, res) => {
       `);
 
     const user = result.recordset[0];
-    const token = generateToken(user);
+    const token = await createSession(user, req);
 
     return res.status(201).json({
       success: true,
@@ -107,7 +129,7 @@ router.post("/register", async (req, res) => {
         fullName: user.FullName,
         email: user.Email,
         role: user.Role
-  }
+      }
     });
 
   } catch (error) {
@@ -171,7 +193,7 @@ router.post("/login", async (req, res) => {
       });
     }
 
-    const token = generateToken(user);
+    const token = await createSession(user, req);
 
     return res.json({
       success: true,
@@ -193,6 +215,43 @@ router.post("/login", async (req, res) => {
       message: "Login failed. Check the backend logs."
     });
   }
+});
+
+// Revoke the current server-side session on logout.
+router.post("/logout", authenticateToken, async (req, res) => {
+  try {
+    const pool = await getPool();
+
+    await pool.request()
+      .input("SessionId", sql.UniqueIdentifier, req.user.sessionId)
+      .input("UserId", sql.Int, req.user.userId)
+      .query(`
+        UPDATE dbo.Sessions
+        SET RevokedAt = SYSUTCDATETIME()
+        WHERE SessionId = @SessionId
+          AND UserId = @UserId
+          AND RevokedAt IS NULL
+      `);
+
+    return res.json({
+      success: true,
+      message: "You have been logged out successfully."
+    });
+  } catch (error) {
+    console.error("Logout error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Logout could not be confirmed by the server."
+    });
+  }
+});
+
+// The frontend calls this after user interaction to extend the idle session.
+router.post("/activity", authenticateToken, (req, res) => {
+  return res.json({
+    success: true,
+    message: "Session activity updated."
+  });
 });
 
 module.exports = router;
