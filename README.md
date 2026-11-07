@@ -122,7 +122,17 @@ Development prompts, tool usage, issues, alternatives, and actual progress are d
 ## Project Status
 
 The application has implemented core authentication, document management, sharing permissions, and audit logging. Cloud deployment and additional production security hardening remain separate tasks.
-
+    
 ## Author
 
 Developed as part of the TrustVault project for the Snovasys assessment.
+### Additional Security Enhancement – Automatic Session Timeout
+
+I independently enhanced TrustVault by implementing an automatic session timeout feature.
+
+- Users are automatically logged out after 15 minutes of inactivity.
+- Active sessions are renewed when users interact with the application.
+- Server-side session validation prevents expired or revoked sessions from accessing protected resources.
+- Manual logout revokes the active session.
+
+**Purpose:** To improve account security and reduce the risk of unauthorized access when users leave their accounts unattended.
