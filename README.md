@@ -97,10 +97,8 @@ TrustVault/
 
 ### 1. Clone the Repository
 
-```bash
 git clone https://github.com/jagarlamudinandini6-source/Trustvault-secure-document-sharing.git
 cd Trustvault-secure-document-sharing
-```
 
 ### 2. Configure Supabase
 
@@ -225,10 +223,27 @@ Development prompts, AI tool usage, issues, alternatives, and implementation pro
 
 ## Project Status
 
-Core application functionality has been implemented, including authentication, password reset, session management, document upload, private storage, document sharing, permission management, and audit logging.
+TrustVault has been deployed and tested successfully.
 
-The application has been tested in a local development environment. Cloud deployment, production configuration, and further security hardening remain to be completed and verified.
+### Live Deployment
 
-## Author
+- Frontend: https://trustvault-secure-document-sharing-sigma.vercel.app/
+- Backend: https://trustvault-secure-document-sharing-u9sv.onrender.com
 
-Developed as part of the TrustVault project for the Snovasys assessment.
+### Verified Functionality
+
+- User registration and login.
+- JWT authentication and server-side session validation.
+- Password reset and session management.
+- Secure document upload to private Supabase Storage.
+- Document viewing and downloading.
+- Separate VIEW and DOWNLOAD permissions.
+- Document sharing and access revocation.
+- Document ownership enforcement.
+- Audit logging of successful and denied access attempts.
+- Document deletion.
+- Upload progress indicator.
+
+The deployed application was tested for authentication, document upload, viewing, downloading, sharing permissions, and access revocation.
+
+Further security hardening and production monitoring are recommended.
