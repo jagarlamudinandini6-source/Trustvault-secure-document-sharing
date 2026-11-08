@@ -1,65 +1,70 @@
-
 const express = require("express");
 const multer = require("multer");
 const path = require("path");
-const fs = require("fs/promises");
 const crypto = require("crypto");
+const { createClient } = require("@supabase/supabase-js");
 
-const { sql, getPool } = require("../database");
+const { getPool } = require("../database");
 const authenticateToken = require("../middleware/auth");
 
 const router = express.Router();
 
-const UPLOAD_DIR = path.join(__dirname, "..", "uploads");
-const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10 MB
+const BUCKET_NAME = "trustvault-documents";
+const MAX_FILE_SIZE = 10 * 1024 * 1024;
 
-// Every document API requires authentication.
-router.use(authenticateToken);
+const ALLOWED_EXTENSIONS = new Set([
+  ".pdf", ".doc", ".docx", ".xls", ".xlsx",
+  ".txt", ".png", ".jpg", ".jpeg"
+]);
 
-// Allowed document types
-const allowedTypes = {
-  ".pdf": ["application/pdf"],
-  ".doc": ["application/msword"],
-  ".docx": [
-    "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-  ],
-  ".xls": ["application/vnd.ms-excel"],
-  ".xlsx": [
-    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-  ],
-  ".txt": ["text/plain"],
-  ".png": ["image/png"],
-  ".jpg": ["image/jpeg"],
-  ".jpeg": ["image/jpeg"]
-};
+const ALLOWED_MIME_TYPES = new Set([
+  "application/pdf",
+  "application/msword",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  "application/vnd.ms-excel",
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  "text/plain",
+  "image/png",
+  "image/jpeg"
+]);
 
-// Store documents using random filenames.
-const storage = multer.diskStorage({
-  destination: (req, file, callback) => {
-    callback(null, UPLOAD_DIR);
-  },
+let storageClient;
 
-  filename: (req, file, callback) => {
-    const extension = path.extname(file.originalname).toLowerCase();
-
-    callback(null, crypto.randomUUID() + extension);
+function getStorage() {
+  if (!process.env.SUPABASE_URL ||
+      !process.env.SUPABASE_SERVICE_ROLE_KEY) {
+    throw new Error("Supabase Storage environment variables are missing.");
   }
-});
+
+  if (!storageClient) {
+    storageClient = createClient(
+      process.env.SUPABASE_URL,
+      process.env.SUPABASE_SERVICE_ROLE_KEY,
+      {
+        auth: {
+          autoRefreshToken: false,
+          persistSession: false
+        }
+      }
+    );
+  }
+
+  return storageClient;
+}
 
 const upload = multer({
-  storage,
+  storage: multer.memoryStorage(),
   limits: {
     fileSize: MAX_FILE_SIZE,
     files: 1
   },
-
   fileFilter: (req, file, callback) => {
     const extension = path.extname(file.originalname).toLowerCase();
-    const validMimes = allowedTypes[extension];
 
-    if (!validMimes || !validMimes.includes(file.mimetype)) {
+    if (!ALLOWED_EXTENSIONS.has(extension) ||
+        !ALLOWED_MIME_TYPES.has(file.mimetype)) {
       return callback(
-        new Error("Unsupported file type. Upload an allowed document format.")
+        new Error("This file type is not allowed.")
       );
     }
 
@@ -67,119 +72,148 @@ const upload = multer({
   }
 });
 
-// Write an audit record.
+function isValidUuid(value) {
+  return typeof value === "string" &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+}
+
+function safeFileName(value) {
+  return path.basename(String(value || "document"))
+    .replace(/[\r\n"]/g, "_");
+}
+
+function contentDisposition(fileName, mode) {
+  const safeName = safeFileName(fileName);
+  const fallbackName = safeName.replace(/[^\x20-\x7E]/g, "_");
+
+  return `${mode}; filename="${fallbackName}"; filename*=UTF-8''${encodeURIComponent(safeName)}`;
+}
+
 async function writeAudit(
-  request,
+  db,
   req,
   documentId,
   action,
-  outcome,
-  details
+  outcome = "SUCCESS",
+  details = ""
 ) {
-  return request
-    .input("UserId", sql.Int, req.user.userId)
-    .input("DocumentId", sql.UniqueIdentifier, documentId)
-    .input("Action", sql.VarChar(40), action)
-    .input("Outcome", sql.VarChar(10), outcome)
-    .input("Details", sql.NVarChar(1000), details)
-    .input("IpAddress", sql.VarChar(45), req.ip || null)
-    .input(
-      "UserAgent",
-      sql.NVarChar(512),
-      req.get("user-agent")?.slice(0, 512) || null
-    )
-    .query(`
-      INSERT INTO dbo.AuditLogs
-      (UserId, DocumentId, Action, Outcome, Details, IpAddress, UserAgent)
-      VALUES
-      (@UserId, @DocumentId, @Action, @Outcome, @Details, @IpAddress, @UserAgent)
-    `);
+  await db.query(
+    `INSERT INTO audit_logs
+      (user_id, document_id, action, outcome, details, ip_address, user_agent)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+    [
+      req.user?.userId || null,
+      documentId || null,
+      action,
+      outcome,
+      String(details).slice(0, 1000),
+      String(req.ip || "").slice(0, 45),
+      String(req.get("user-agent") || "").slice(0, 512)
+    ]
+  );
 }
 
-// Upload a document.
-router.post("/upload", upload.single("document"), async (req, res) => {
-  let uploadedFilePath;
+router.use(authenticateToken);
 
-  try {
-    if (!req.file) {
-      return res.status(400).json({
-        success: false,
-        message: "Please select a document."
-      });
-    }
+// --------------------------------------------------
+// UPLOAD DOCUMENT
+// --------------------------------------------------
 
-    uploadedFilePath = req.file.path;
+router.post(
+  "/upload",
+  (req, res, next) => {
+    upload.single("file")(req, res, (error) => {
+      if (error) {
+        return res.status(400).json({
+          success: false,
+          message: error.code === "LIMIT_FILE_SIZE"
+            ? "File size must not exceed 10 MB."
+            : error.message
+        });
+      }
 
-    const pool = await getPool();
-
-    const fileBuffer = await fs.readFile(req.file.path);
-    const hash = crypto
-      .createHash("sha256")
-      .update(fileBuffer)
-      .digest("hex");
-
-    const storedFileName = req.file.filename;
-    const originalFileName = path.basename(req.file.originalname).slice(0, 255);
-    const storageKey = `uploads/${storedFileName}`;
-
-    // Save document and audit record in one SQL transaction.
-    const transaction = new sql.Transaction(pool);
-
-    await transaction.begin();
+      next();
+    });
+  },
+  async (req, res) => {
+    let storageKey;
+    let storageUploaded = false;
+    let client;
 
     try {
-      const insertRequest = new sql.Request(transaction);
+      if (!req.file) {
+        return res.status(400).json({
+          success: false,
+          message: "Please select a file to upload."
+        });
+      }
 
-      const result = await insertRequest
-        .input("OwnerId", sql.Int, req.user.userId)
-        .input("OriginalFileName", sql.NVarChar(255), originalFileName)
-        .input("StoredFileName", sql.NVarChar(255), storedFileName)
-        .input("ContentType", sql.NVarChar(127), req.file.mimetype)
-        .input("FileSize", sql.BigInt, req.file.size)
-        .input("StorageKey", sql.NVarChar(500), storageKey)
-        .input("SHA256Hash", sql.Char(64), hash)
-        .query(`
-          INSERT INTO dbo.Documents
-          (
-            OwnerId,
-            OriginalFileName,
-            StoredFileName,
-            ContentType,
-            FileSize,
-            StorageKey,
-            SHA256Hash
-          )
-          OUTPUT
-            INSERTED.DocumentId,
-            INSERTED.OriginalFileName,
-            INSERTED.FileSize,
-            INSERTED.UploadedAt
-          VALUES
-          (
-            @OwnerId,
-            @OriginalFileName,
-            @StoredFileName,
-            @ContentType,
-            @FileSize,
-            @StorageKey,
-            @SHA256Hash
-          )
-        `);
+      const pool = await getPool();
+      const extension = path.extname(req.file.originalname).toLowerCase();
+      const storedFileName = `${crypto.randomUUID()}${extension}`;
 
-      const document = result.recordset[0];
+      storageKey = `${req.user.userId}/${storedFileName}`;
 
-      const auditRequest = new sql.Request(transaction);
+      const sha256Hash = crypto
+        .createHash("sha256")
+        .update(req.file.buffer)
+        .digest("hex");
 
-      await writeAudit(
-        auditRequest,
-        req,
-        document.DocumentId,
-        "DOCUMENT_UPLOADED",
-        "SUCCESS",
-        "Document uploaded successfully."
+      const originalFileName = safeFileName(req.file.originalname);
+
+      console.time("TrustVault storage upload");
+      const { error: storageError } = await getStorage()
+        .storage
+        .from(BUCKET_NAME)
+        .upload(storageKey, req.file.buffer, {
+          contentType: req.file.mimetype,
+          upsert: false
+        });
+      console.timeEnd("TrustVault storage upload");
+      if (storageError) {
+        throw storageError;
+      }
+
+      storageUploaded = true;
+
+      client = await pool.connect();
+      await client.query("BEGIN");
+
+      const result = await client.query(
+        `INSERT INTO documents
+          (owner_id, original_file_name, stored_file_name,
+           content_type, file_size, storage_key, sha256_hash)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
+         RETURNING
+           document_id AS "DocumentId",
+           original_file_name AS "OriginalFileName",
+           file_size AS "FileSize",
+           uploaded_at AS "UploadedAt"`,
+        [
+          req.user.userId,
+          originalFileName,
+          storedFileName,
+          req.file.mimetype,
+          req.file.size,
+          storageKey,
+          sha256Hash
+        ]
       );
 
-      await transaction.commit();
+      const document = result.rows[0];
+
+      await writeAudit(
+        client,
+        req,
+        document.DocumentId,
+        "UPLOAD",
+        "SUCCESS",
+        `Uploaded ${originalFileName}`
+      );
+
+      console.time("TrustVault database save and audit");
+      console.timeEnd("TrustVault database save and audit");
+      await client.query("COMMIT");
 
       return res.status(201).json({
         success: true,
@@ -188,61 +222,74 @@ router.post("/upload", upload.single("document"), async (req, res) => {
       });
 
     } catch (error) {
-      await transaction.rollback().catch(() => {});
-      throw error;
+      if (client) {
+        try {
+          await client.query("ROLLBACK");
+        } catch (rollbackError) {
+          console.error("Upload rollback error:", rollbackError);
+        }
+      }
+
+      if (storageUploaded && storageKey) {
+        try {
+          await getStorage()
+            .storage
+            .from(BUCKET_NAME)
+            .remove([storageKey]);
+        } catch (cleanupError) {
+          console.error("Storage cleanup error:", cleanupError);
+        }
+      }
+
+      console.error("Document upload error:", error);
+
+      return res.status(500).json({
+        success: false,
+        message: "Document upload failed. Check the backend logs."
+      });
+
+    } finally {
+      if (client) client.release();
     }
-
-  } catch (error) {
-    if (uploadedFilePath) {
-      await fs.unlink(uploadedFilePath).catch(() => {});
-    }
-
-    console.error("Document upload error:", error);
-
-    return res.status(500).json({
-      success: false,
-      message: "Document upload failed."
-    });
   }
-});
+);
 
-// List documents owned by the user or shared with view permission.
+// --------------------------------------------------
+// LIST OWNED AND SHARED DOCUMENTS
+// --------------------------------------------------
+
 router.get("/", async (req, res) => {
   try {
     const pool = await getPool();
 
-    const result = await pool.request()
-      .input("UserId", sql.Int, req.user.userId)
-      .query(`
-        SELECT
-          d.DocumentId,
-          d.OriginalFileName,
-          d.ContentType,
-          d.FileSize,
-          d.UploadedAt,
-          d.OwnerId
-        FROM dbo.Documents d
-        WHERE d.IsDeleted = 0
-          AND (
-            d.OwnerId = @UserId
-            OR EXISTS (
-              SELECT 1
-              FROM dbo.DocumentPermissions p
-              WHERE p.DocumentId = d.DocumentId
-                AND p.UserId = @UserId
-                AND p.CanView = 1
-            )
-          )
-        ORDER BY d.UploadedAt DESC
-      `);
+    const result = await pool.query(
+      `SELECT DISTINCT
+         d.document_id AS "DocumentId",
+         d.original_file_name AS "OriginalFileName",
+         d.content_type AS "ContentType",
+         d.file_size AS "FileSize",
+         d.uploaded_at AS "UploadedAt",
+         d.owner_id AS "OwnerId"
+       FROM documents d
+       LEFT JOIN document_permissions p
+         ON p.document_id = d.document_id
+        AND p.user_id = $1
+       WHERE d.is_deleted = FALSE
+         AND (
+           d.owner_id = $1
+           OR p.can_view = TRUE
+         )
+       ORDER BY d.uploaded_at DESC`,
+      [req.user.userId]
+    );
 
     return res.json({
       success: true,
-      documents: result.recordset
+      documents: result.rows
     });
 
   } catch (error) {
-    console.error("Document list error:", error);
+    console.error("List documents error:", error);
 
     return res.status(500).json({
       success: false,
@@ -251,561 +298,411 @@ router.get("/", async (req, res) => {
   }
 });
 
-// Open a document after checking view permission.
-router.get("/:id/view", async (req, res) => {
-  await serveDocument(req, res, false);
-});
+// --------------------------------------------------
+// VIEW OR DOWNLOAD DOCUMENT
+// --------------------------------------------------
 
-// Download a document after checking download permission.
-router.get("/:id/download", async (req, res) => {
-  await serveDocument(req, res, true);
-});
+async function serveDocument(req, res, mode) {
+  const documentId = req.params.id;
 
-// Shared access-checking function.
-async function serveDocument(req, res, download) {
+  if (!isValidUuid(documentId)) {
+    return res.status(400).json({
+      success: false,
+      message: "Invalid document ID."
+    });
+  }
+
   try {
-    const documentId = req.params.id;
-
-    const uuidPattern =
-      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
-    if (!uuidPattern.test(documentId)) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid document ID."
-      });
-    }
-
     const pool = await getPool();
 
-    const documentResult = await pool.request()
-      .input("DocumentId", sql.UniqueIdentifier, documentId)
-      .query(`
-        SELECT *
-        FROM dbo.Documents
-        WHERE DocumentId = @DocumentId
-          AND IsDeleted = 0
-      `);
+    const result = await pool.query(
+      `SELECT
+         d.document_id,
+         d.owner_id,
+         d.original_file_name,
+         d.content_type,
+         d.storage_key,
+         d.is_deleted,
+         (
+           d.owner_id = $2
+           OR (
+             p.can_view = TRUE
+             AND ($3 = FALSE OR p.can_download = TRUE)
+           )
+         ) AS is_allowed
+       FROM documents d
+       LEFT JOIN document_permissions p
+         ON p.document_id = d.document_id
+        AND p.user_id = $2
+       WHERE d.document_id = $1`,
+      [documentId, req.user.userId, mode === "download"]
+    );
 
-    const document = documentResult.recordset[0];
+    const document = result.rows[0];
 
-    if (!document) {
+    if (!document || document.is_deleted || !document.is_allowed) {
       await writeAudit(
-        pool.request(),
+        pool,
         req,
-        null,
-        download ? "DOCUMENT_DOWNLOAD" : "DOCUMENT_VIEW",
+        document ? document.document_id : null,
+        mode.toUpperCase(),
         "DENIED",
-        `Requested document not found: ${documentId}`
-      );
-
-      return res.status(404).json({
-        success: false,
-        message: "Document not found."
-      });
-    }
-    // Owners can always view and download their own documents.
-    // Other users need explicit permissions.
-    // Supply the download flag as a SQL parameter.
-    // This separate request avoids relying on client-provided permission values.
-    const permissionCheck = await pool.request()
-      .input("DocumentId", sql.UniqueIdentifier, documentId)
-      .input("UserId", sql.Int, req.user.userId)
-      .input("Download", sql.Bit, download)
-      .query(`
-        SELECT CASE
-          WHEN d.OwnerId = @UserId THEN 1
-          WHEN p.CanView = 1
-               AND (@Download = 0 OR p.CanDownload = 1) THEN 1
-          ELSE 0
-        END AS IsAllowed
-        FROM dbo.Documents d
-        LEFT JOIN dbo.DocumentPermissions p
-          ON p.DocumentId = d.DocumentId
-          AND p.UserId = @UserId
-        WHERE d.DocumentId = @DocumentId
-      `);
-
-    const isAllowed =
-      permissionCheck.recordset.length > 0 &&
-      permissionCheck.recordset[0].IsAllowed === 1;
-
-    if (!isAllowed) {
-      await writeAudit(
-        pool.request(),
-        req,
-        document.DocumentId,
-        download ? "DOCUMENT_DOWNLOAD" : "DOCUMENT_VIEW",
-        "DENIED",
-        "User attempted to access a document without sufficient permission."
+        "Document access denied."
       );
 
       return res.status(403).json({
         success: false,
-        message: "Access denied. You do not have permission."
+        message: "You do not have permission to access this document."
       });
     }
+
+    const { data, error } = await getStorage()
+      .storage
+      .from(BUCKET_NAME)
+      .download(document.storage_key);
+
+    if (error) {
+      throw error;
+    }
+
+    const fileBuffer = Buffer.from(await data.arrayBuffer());
 
     await writeAudit(
-      pool.request(),
+      pool,
       req,
-      document.DocumentId,
-      download ? "DOCUMENT_DOWNLOADED" : "DOCUMENT_VIEWED",
+      document.document_id,
+      mode.toUpperCase(),
       "SUCCESS",
-      download
-        ? "Document downloaded successfully."
-        : "Document viewed successfully."
+      `${mode === "view" ? "Viewed" : "Downloaded"} ${document.original_file_name}`
     );
-
-    // Never use a client-provided file path.
-    const filePath = path.resolve(
-      UPLOAD_DIR,
-      path.basename(document.StoredFileName)
-    );
-
-    if (!filePath.startsWith(UPLOAD_DIR + path.sep)) {
-      return res.status(403).json({
-        success: false,
-        message: "Invalid document storage location."
-      });
-    }
-
-    await fs.access(filePath);
-
-// Security headers to prevent caching of confidential documents
-res.setHeader(
-  "Cache-Control",
-  "private, no-store, no-cache, must-revalidate"
-);
-
-res.setHeader("Pragma", "no-cache");
-
-res.setHeader("X-Content-Type-Options", "nosniff");
-
-if (download) {
-  return res.download(filePath, document.OriginalFileName);
-}
-
-res.setHeader(
-  "Content-Type",
-  document.ContentType || "application/octet-stream"
-);
-
-res.setHeader(
-  "Content-Disposition",
-  `inline; filename*=UTF-8''${encodeURIComponent(document.OriginalFileName)}`
-);
-
-return res.sendFile(filePath);
-
 
     res.setHeader(
       "Content-Type",
-      document.ContentType || "application/octet-stream"
+      document.content_type || "application/octet-stream"
     );
-
     res.setHeader(
       "Content-Disposition",
-      `inline; filename*=UTF-8''${encodeURIComponent(document.OriginalFileName)}`
+      contentDisposition(
+        document.original_file_name,
+        mode === "view" ? "inline" : "attachment"
+      )
     );
+    res.setHeader("Cache-Control", "private, no-store, no-cache, must-revalidate");
+    res.setHeader("Pragma", "no-cache");
+    res.setHeader("X-Content-Type-Options", "nosniff");
 
-    return res.sendFile(filePath);
-
-  } catch (error) {
-    console.error("Document access error:", error);
-
-    if (!res.headersSent) {
-      return res.status(500).json({
-        success: false,
-        message: "Unable to access this document."
-      });
-    }
-  }
-}
-
-// Handle upload validation errors.
-router.use((error, req, res, next) => {
-  if (error instanceof multer.MulterError) {
-    const status = error.code === "LIMIT_FILE_SIZE" ? 413 : 400;
-
-    return res.status(status).json({
-      success: false,
-      message:
-        error.code === "LIMIT_FILE_SIZE"
-          ? "Maximum file size is 10 MB."
-          : error.message
-    });
-  }
-
-  if (error) {
-    return res.status(400).json({
-      success: false,
-      message: error.message || "Invalid document upload."
-    });
-  }
-
-  next();
-});
-
-// SHARE DOCUMENT WITH ANOTHER USER
-router.post("/:id/share", async (req, res) => {
-  try {
-    const documentId = req.params.id;
-    const email = String(req.body.email || "")
-      .trim()
-      .toLowerCase();
-
-    const canView =
-      req.body.canView === undefined ? true : req.body.canView;
-
-    const canDownload =
-      req.body.canDownload === undefined
-        ? false
-        : req.body.canDownload;
-
-    const uuidPattern =
-      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
-    if (!uuidPattern.test(documentId)) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid document ID."
-      });
-    }
-
-    if (
-      !email ||
-      email.length > 255 ||
-      !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)
-    ) {
-      return res.status(400).json({
-        success: false,
-        message: "Enter a valid recipient email."
-      });
-    }
-
-    if (
-      typeof canView !== "boolean" ||
-      typeof canDownload !== "boolean" ||
-      (canDownload && !canView)
-    ) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid document permissions."
-      });
-    }
-
-    const pool = await getPool();
-
-    // Check document ownership.
-    const documentResult = await pool.request()
-      .input("DocumentId", sql.UniqueIdentifier, documentId)
-      .query(`
-        SELECT DocumentId, OwnerId
-        FROM dbo.Documents
-        WHERE DocumentId = @DocumentId
-          AND IsDeleted = 0
-      `);
-
-    const document = documentResult.recordset[0];
-
-    if (!document) {
-      return res.status(404).json({
-        success: false,
-        message: "Document not found."
-      });
-    }
-
-    // Only the document owner can share it.
-    if (document.OwnerId !== req.user.userId) {
-      await writeAudit(
-        pool.request(),
-        req,
-        documentId,
-        "DOCUMENT_SHARE",
-        "DENIED",
-        "Unauthorized attempt to share a document."
-      );
-
-      return res.status(403).json({
-        success: false,
-        message: "Only the document owner can share it."
-      });
-    }
-
-    // Find the recipient.
-    const userResult = await pool.request()
-      .input("Email", sql.NVarChar(255), email)
-      .query(`
-        SELECT UserId, Email
-        FROM dbo.Users
-        WHERE Email = @Email
-          AND IsActive = 1
-      `);
-
-    const recipient = userResult.recordset[0];
-
-    if (!recipient) {
-      return res.status(404).json({
-        success: false,
-        message: "Recipient account not found."
-      });
-    }
-
-    if (recipient.UserId === req.user.userId) {
-      return res.status(400).json({
-        success: false,
-        message: "You already own this document."
-      });
-    }
-
-    // Save permission and audit record together.
-    const transaction = new sql.Transaction(pool);
-
-    await transaction.begin();
-
-    try {
-      await new sql.Request(transaction)
-        .input("DocumentId", sql.UniqueIdentifier, documentId)
-        .input("TargetUserId", sql.Int, recipient.UserId)
-        .input("GrantedBy", sql.Int, req.user.userId)
-        .input("CanView", sql.Bit, canView)
-        .input("CanDownload", sql.Bit, canDownload)
-        .query(`
-          UPDATE dbo.DocumentPermissions
-          SET
-            CanView = @CanView,
-            CanDownload = @CanDownload,
-            GrantedBy = @GrantedBy,
-            GrantedAt = SYSUTCDATETIME()
-          WHERE DocumentId = @DocumentId
-            AND UserId = @TargetUserId;
-
-          IF @@ROWCOUNT = 0
-          BEGIN
-            INSERT INTO dbo.DocumentPermissions
-            (
-              DocumentId,
-              UserId,
-              CanView,
-              CanDownload,
-              GrantedBy
-            )
-            VALUES
-            (
-              @DocumentId,
-              @TargetUserId,
-              @CanView,
-              @CanDownload,
-              @GrantedBy
-            );
-          END
-        `);
-
-      await writeAudit(
-        new sql.Request(transaction),
-        req,
-        documentId,
-        "DOCUMENT_SHARED",
-        "SUCCESS",
-        `Shared with ${email}. View: ${canView}; Download: ${canDownload}.`
-      );
-
-      await transaction.commit();
-
-      return res.json({
-        success: true,
-        message: "Document shared successfully.",
-        recipient: email,
-        permissions: {
-          canView,
-          canDownload
-        }
-      });
-
-    } catch (error) {
-      await transaction.rollback().catch(() => {});
-      throw error;
-    }
+    return res.send(fileBuffer);
 
   } catch (error) {
-    console.error("Document sharing error:", error);
+    console.error(`Document ${mode} error:`, error);
 
     return res.status(500).json({
       success: false,
-      message: "Unable to share document."
+      message: `Unable to ${mode} this document.`
     });
+  }
+}
+
+router.get("/:id/view", (req, res) => {
+  return serveDocument(req, res, "view");
+});
+
+router.get("/:id/download", (req, res) => {
+  return serveDocument(req, res, "download");
+});
+
+// --------------------------------------------------
+// SHARE DOCUMENT WITH ANOTHER USER
+// --------------------------------------------------
+
+
+router.post("/:id/share", async (req, res) => {
+  const documentId = req.params.id;
+  const recipientEmail = String(req.body.email || "").trim().toLowerCase();
+
+  const canView = req.body.canView !== false;
+  const canDownload = req.body.canDownload === true;
+
+  if (
+    !isValidUuid(documentId) ||
+    !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(recipientEmail)
+  ) {
+    return res.status(400).json({
+      success: false,
+      message: "Valid document ID and recipient email are required."
+    });
+  }
+
+  if (canDownload && !canView) {
+    return res.status(400).json({
+      success: false,
+      message: "Download permission requires view permission."
+    });
+  }
+
+  let client;
+
+  try {
+    const pool = await getPool();
+    client = await pool.connect();
+
+    await client.query("BEGIN");
+
+    const documentResult = await client.query(
+      `SELECT document_id
+       FROM documents
+       WHERE document_id = $1
+         AND owner_id = $2
+         AND is_deleted = FALSE`,
+      [documentId, req.user.userId]
+    );
+
+    if (documentResult.rowCount === 0) {
+      await client.query("ROLLBACK");
+
+      return res.status(404).json({
+        success: false,
+        message: "Document not found or you are not the owner."
+      });
+    }
+
+    const userResult = await client.query(
+      `SELECT user_id, email
+       FROM users
+       WHERE email = $1
+         AND is_active = TRUE`,
+      [recipientEmail]
+    );
+
+    if (userResult.rowCount === 0) {
+      await client.query("ROLLBACK");
+
+      return res.status(404).json({
+        success: false,
+        message: "Recipient account was not found or is inactive."
+      });
+    }
+
+    const recipientId = userResult.rows[0].user_id;
+
+    if (recipientId === req.user.userId) {
+      await client.query("ROLLBACK");
+
+      return res.status(400).json({
+        success: false,
+        message: "You cannot share a document with yourself."
+      });
+    }
+
+    await client.query(
+      `INSERT INTO document_permissions
+        (document_id, user_id, can_view, can_download, granted_by)
+       VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (document_id, user_id)
+       DO UPDATE SET
+         can_view = EXCLUDED.can_view,
+         can_download = EXCLUDED.can_download,
+         granted_by = EXCLUDED.granted_by,
+         granted_at = NOW()`,
+      [
+        documentId,
+        recipientId,
+        canView,
+        canDownload,
+        req.user.userId
+      ]
+    );
+
+    await writeAudit(
+      client,
+      req,
+      documentId,
+      "SHARE",
+      "SUCCESS",
+      `Shared with ${recipientEmail}; view=${canView}; download=${canDownload}`
+    );
+
+    await client.query("COMMIT");
+
+    return res.json({
+      success: true,
+      message: "Document permissions updated successfully."
+    });
+
+  } catch (error) {
+    if (client) {
+      try {
+        await client.query("ROLLBACK");
+      } catch (rollbackError) {
+        console.error("Share rollback error:", rollbackError);
+      }
+    }
+
+    console.error("Share document error:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Unable to share this document."
+    });
+
+  } finally {
+    if (client) client.release();
   }
 });
 
 
+// --------------------------------------------------
+// DELETE DOCUMENT (OWNER ONLY)
+// --------------------------------------------------
 
-// DELETE A DOCUMENT (OWNER ONLY).
-// Soft-delete the database record, remove its permissions, and delete the stored file.
-// Keeping the row preserves the document's audit history.
 router.delete("/:id", async (req, res) => {
+  const documentId = req.params.id;
+
+  if (!isValidUuid(documentId)) {
+    return res.status(400).json({
+      success: false,
+      message: "Invalid document ID."
+    });
+  }
+
+  let client;
+  let storageKey;
+
   try {
-    const documentId = req.params.id;
-    const uuidPattern =
-      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
-    if (!uuidPattern.test(documentId)) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid document ID."
-      });
-    }
-
     const pool = await getPool();
-    const documentResult = await pool.request()
-      .input("DocumentId", sql.UniqueIdentifier, documentId)
-      .query(`
-        SELECT DocumentId, OwnerId, StoredFileName, OriginalFileName
-        FROM dbo.Documents
-        WHERE DocumentId = @DocumentId
-          AND IsDeleted = 0
-      `);
+    client = await pool.connect();
 
-    const document = documentResult.recordset[0];
-    if (!document) {
+    await client.query("BEGIN");
+
+    const result = await client.query(
+      `UPDATE documents
+       SET is_deleted = TRUE
+       WHERE document_id = $1
+         AND owner_id = $2
+         AND is_deleted = FALSE
+       RETURNING storage_key, original_file_name`,
+      [documentId, req.user.userId]
+    );
+
+    if (result.rowCount === 0) {
+      await client.query("ROLLBACK");
+
       return res.status(404).json({
         success: false,
-        message: "Document not found."
+        message: "Document not found or you are not the owner."
       });
     }
 
-    if (document.OwnerId !== req.user.userId) {
-      await writeAudit(
-        pool.request(),
-        req,
-        document.DocumentId,
-        "DOCUMENT_DELETE",
-        "DENIED",
-        "Unauthorized attempt to delete a document."
-      );
-      return res.status(403).json({
-        success: false,
-        message: "Only the document owner can delete it."
-      });
-    }
+    storageKey = result.rows[0].storage_key;
 
-    const transaction = new sql.Transaction(pool);
-    await transaction.begin();
-
-    try {
-      await new sql.Request(transaction)
-        .input("DocumentId", sql.UniqueIdentifier, documentId)
-        .query(`
-          UPDATE dbo.Documents
-          SET IsDeleted = 1
-          WHERE DocumentId = @DocumentId
-            AND IsDeleted = 0;
-
-          DELETE FROM dbo.DocumentPermissions
-          WHERE DocumentId = @DocumentId;
-        `);
-
-      await writeAudit(
-        new sql.Request(transaction),
-        req,
-        document.DocumentId,
-        "DOCUMENT_DELETED",
-        "SUCCESS",
-        `Owner deleted document "${document.OriginalFileName}". All shared permissions were removed.`
-      );
-
-      await transaction.commit();
-    } catch (error) {
-      await transaction.rollback().catch(() => {});
-      throw error;
-    }
-
-    const filePath = path.resolve(
-      UPLOAD_DIR,
-      path.basename(document.StoredFileName)
+    await client.query(
+      `DELETE FROM document_permissions
+       WHERE document_id = $1`,
+      [documentId]
     );
-    if (filePath.startsWith(UPLOAD_DIR + path.sep)) {
-      await fs.unlink(filePath).catch((error) => {
-        if (error.code !== "ENOENT") {
-          console.error("Deleted document file cleanup failed:", error);
-        }
-      });
+
+    await writeAudit(
+      client,
+      req,
+      documentId,
+      "DELETE",
+      "SUCCESS",
+      `Deleted ${result.rows[0].original_file_name}`
+    );
+
+    await client.query("COMMIT");
+
+    const { error: storageError } = await getStorage()
+      .storage
+      .from(BUCKET_NAME)
+      .remove([storageKey]);
+
+    if (storageError) {
+      console.error("Deleted document storage cleanup error:", storageError);
     }
 
     return res.json({
       success: true,
       message: "Document deleted successfully."
     });
+
   } catch (error) {
-    console.error("Document deletion error:", error);
+    if (client) {
+      try {
+        await client.query("ROLLBACK");
+      } catch (rollbackError) {
+        console.error("Delete rollback error:", rollbackError);
+      }
+    }
+
+    console.error("Delete document error:", error);
+
     return res.status(500).json({
       success: false,
-      message: "Unable to delete document."
+      message: "Unable to delete this document."
     });
+
+  } finally {
+    if (client) client.release();
   }
 });
 
-// LIST CURRENT SHARED PERMISSIONS (OWNER ONLY).
+// --------------------------------------------------
+// LIST DOCUMENT PERMISSIONS (OWNER ONLY)
+// --------------------------------------------------
+
 router.get("/:id/permissions", async (req, res) => {
+  const documentId = req.params.id;
+
+  if (!isValidUuid(documentId)) {
+    return res.status(400).json({
+      success: false,
+      message: "Invalid document ID."
+    });
+  }
+
   try {
-    const documentId = req.params.id;
-    const uuidPattern =
-      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
-    if (!uuidPattern.test(documentId)) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid document ID."
-      });
-    }
-
     const pool = await getPool();
-    const ownerResult = await pool.request()
-      .input("DocumentId", sql.UniqueIdentifier, documentId)
-      .query(`
-        SELECT OwnerId
-        FROM dbo.Documents
-        WHERE DocumentId = @DocumentId
-          AND IsDeleted = 0
-      `);
 
-    const document = ownerResult.recordset[0];
-    if (!document) {
+    const ownerResult = await pool.query(
+      `SELECT document_id
+       FROM documents
+       WHERE document_id = $1
+         AND owner_id = $2
+         AND is_deleted = FALSE`,
+      [documentId, req.user.userId]
+    );
+
+    if (ownerResult.rowCount === 0) {
       return res.status(404).json({
         success: false,
-        message: "Document not found."
+        message: "Document not found or you are not the owner."
       });
     }
 
-    if (document.OwnerId !== req.user.userId) {
-      return res.status(403).json({
-        success: false,
-        message: "Only the document owner can manage access."
-      });
-    }
-
-    const result = await pool.request()
-      .input("DocumentId", sql.UniqueIdentifier, documentId)
-      .query(`
-        SELECT
-          p.UserId,
-          u.FullName,
-          u.Email,
-          p.CanView,
-          p.CanDownload,
-          p.GrantedAt
-        FROM dbo.DocumentPermissions p
-        INNER JOIN dbo.Users u ON u.UserId = p.UserId
-        WHERE p.DocumentId = @DocumentId
-        ORDER BY u.Email
-      `);
+    const result = await pool.query(
+      `SELECT
+         u.user_id AS "UserId",
+         u.full_name AS "FullName",
+         u.email AS "Email",
+         p.can_view AS "CanView",
+         p.can_download AS "CanDownload",
+         p.granted_at AS "GrantedAt"
+       FROM document_permissions p
+       JOIN users u ON u.user_id = p.user_id
+       WHERE p.document_id = $1
+       ORDER BY p.granted_at DESC`,
+      [documentId]
+    );
 
     return res.json({
       success: true,
-      permissions: result.recordset
+      permissions: result.rows
     });
+
   } catch (error) {
-    console.error("Document permission list error:", error);
+    console.error("List permissions error:", error);
+
     return res.status(500).json({
       success: false,
       message: "Unable to retrieve document permissions."
@@ -813,161 +710,146 @@ router.get("/:id/permissions", async (req, res) => {
   }
 });
 
-// REVOKE ALL SHARED PERMISSIONS FOR ONE USER (OWNER ONLY).
+// --------------------------------------------------
+// REVOKE DOCUMENT PERMISSION (OWNER ONLY)
+// --------------------------------------------------
+
 router.delete("/:id/permissions/:userId", async (req, res) => {
+  const documentId = req.params.id;
+  const recipientId = Number(req.params.userId);
+
+  if (!isValidUuid(documentId) ||
+      !Number.isInteger(recipientId) ||
+      recipientId <= 0) {
+    return res.status(400).json({
+      success: false,
+      message: "Invalid document or user ID."
+    });
+  }
+
+  let client;
+
   try {
-    const documentId = req.params.id;
-    const targetUserId = Number(req.params.userId);
-    const uuidPattern =
-      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
-    if (!uuidPattern.test(documentId) ||
-        !Number.isSafeInteger(targetUserId) ||
-        targetUserId <= 0) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid document or user ID."
-      });
-    }
-
     const pool = await getPool();
-    const documentResult = await pool.request()
-      .input("DocumentId", sql.UniqueIdentifier, documentId)
-      .query(`
-        SELECT DocumentId, OwnerId, OriginalFileName
-        FROM dbo.Documents
-        WHERE DocumentId = @DocumentId
-          AND IsDeleted = 0
-      `);
+    client = await pool.connect();
 
-    const document = documentResult.recordset[0];
-    if (!document) {
+    await client.query("BEGIN");
+
+    const ownerResult = await client.query(
+      `SELECT document_id
+       FROM documents
+       WHERE document_id = $1
+         AND owner_id = $2
+         AND is_deleted = FALSE`,
+      [documentId, req.user.userId]
+    );
+
+    if (ownerResult.rowCount === 0) {
+      await client.query("ROLLBACK");
+
       return res.status(404).json({
         success: false,
-        message: "Document not found."
+        message: "Document not found or you are not the owner."
       });
     }
 
-    if (document.OwnerId !== req.user.userId) {
-      await writeAudit(
-        pool.request(),
-        req,
-        document.DocumentId,
-        "DOCUMENT_ACCESS_REVOKE",
-        "DENIED",
-        "Unauthorized attempt to revoke document access."
-      );
-      return res.status(403).json({
-        success: false,
-        message: "Only the document owner can revoke access."
-      });
-    }
+    const deleteResult = await client.query(
+      `DELETE FROM document_permissions
+       WHERE document_id = $1
+         AND user_id = $2`,
+      [documentId, recipientId]
+    );
 
-    const targetResult = await pool.request()
-      .input("DocumentId", sql.UniqueIdentifier, documentId)
-      .input("TargetUserId", sql.Int, targetUserId)
-      .query(`
-        SELECT p.UserId, u.Email
-        FROM dbo.DocumentPermissions p
-        INNER JOIN dbo.Users u ON u.UserId = p.UserId
-        WHERE p.DocumentId = @DocumentId
-          AND p.UserId = @TargetUserId
-      `);
+    if (deleteResult.rowCount === 0) {
+      await client.query("ROLLBACK");
 
-    const target = targetResult.recordset[0];
-    if (!target) {
       return res.status(404).json({
         success: false,
-        message: "This user does not currently have access to the document."
+        message: "Permission was not found."
       });
     }
 
-    const transaction = new sql.Transaction(pool);
-    await transaction.begin();
+    await writeAudit(
+      client,
+      req,
+      documentId,
+      "REVOKE_PERMISSION",
+      "SUCCESS",
+      `Revoked permission for user ${recipientId}`
+    );
 
-    try {
-      await new sql.Request(transaction)
-        .input("DocumentId", sql.UniqueIdentifier, documentId)
-        .input("TargetUserId", sql.Int, targetUserId)
-        .query(`
-          DELETE FROM dbo.DocumentPermissions
-          WHERE DocumentId = @DocumentId
-            AND UserId = @TargetUserId
-        `);
-
-      await writeAudit(
-        new sql.Request(transaction),
-        req,
-        document.DocumentId,
-        "DOCUMENT_ACCESS_REVOKED",
-        "SUCCESS",
-        `Access to "${document.OriginalFileName}" revoked for ${target.Email}.`
-      );
-
-      await transaction.commit();
-    } catch (error) {
-      await transaction.rollback().catch(() => {});
-      throw error;
-    }
+    await client.query("COMMIT");
 
     return res.json({
       success: true,
-      message: "Document access revoked successfully.",
-      revokedUser: target.Email
+      message: "Document permission revoked successfully."
     });
+
   } catch (error) {
-    console.error("Document permission revocation error:", error);
+    if (client) {
+      try {
+        await client.query("ROLLBACK");
+      } catch (rollbackError) {
+        console.error("Revoke rollback error:", rollbackError);
+      }
+    }
+
+    console.error("Revoke permission error:", error);
+
     return res.status(500).json({
       success: false,
-      message: "Unable to revoke document access."
+      message: "Unable to revoke document permission."
     });
+
+  } finally {
+    if (client) client.release();
   }
 });
 
-// GET ACTIVITY LOGS FOR THE LOGGED-IN USER
+// --------------------------------------------------
+// AUDIT LOGS
+// --------------------------------------------------
+
 router.get("/audit", async (req, res) => {
   try {
     const pool = await getPool();
 
-    const result = await pool.request()
-      .input("UserId", sql.Int, req.user.userId)
-      .query(`
-        SELECT TOP (100)
-          a.AuditId,
-          a.UserId,
-          u.FullName AS UserName,
-          u.Email AS UserEmail,
-          a.DocumentId,
-          d.OriginalFileName,
-          a.Action,
-          a.Outcome,
-          a.Details,
-          a.OccurredAt
-        FROM dbo.AuditLogs a
-        LEFT JOIN dbo.Users u
-          ON a.UserId = u.UserId
-        LEFT JOIN dbo.Documents d
-          ON a.DocumentId = d.DocumentId
-        WHERE
-          a.UserId = @UserId
-          OR d.OwnerId = @UserId
-        ORDER BY a.OccurredAt DESC, a.AuditId DESC
-      `);
+    const result = await pool.query(
+      `SELECT
+         a.audit_id AS "AuditId",
+         a.user_id AS "UserId",
+         u.full_name AS "UserName",
+         u.email AS "UserEmail",
+         a.document_id AS "DocumentId",
+         d.original_file_name AS "OriginalFileName",
+         a.action AS "Action",
+         a.outcome AS "Outcome",
+         a.details AS "Details",
+         a.occurred_at AS "OccurredAt"
+       FROM audit_logs a
+       LEFT JOIN users u ON u.user_id = a.user_id
+       LEFT JOIN documents d ON d.document_id = a.document_id
+       WHERE
+         a.user_id = $1
+         OR d.owner_id = $1
+       ORDER BY a.occurred_at DESC
+       LIMIT 100`,
+      [req.user.userId]
+    );
 
-    res.json({
+    return res.json({
       success: true,
-      logs: result.recordset
+      logs: result.rows
     });
 
   } catch (error) {
     console.error("Audit logs error:", error);
 
-    res.status(500).json({
+    return res.status(500).json({
       success: false,
-      message: "Unable to retrieve activity logs."
+      message: "Unable to retrieve audit logs."
     });
   }
 });
-
 
 module.exports = router;

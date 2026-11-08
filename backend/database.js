@@ -1,42 +1,48 @@
-
 require("dotenv").config();
 
-const sql = require("mssql/msnodesqlv8");
+const { Pool } = require("pg");
 
-const config = {
-  server: process.env.DB_SERVER,
-  database: process.env.DB_NAME,
-  driver: process.env.DB_DRIVER,
+if (!process.env.DATABASE_URL) {
+  console.error("DATABASE_URL is missing from backend environment variables.");
+}
 
-  options: {
-    trustedConnection: true,
-    trustServerCertificate: true
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+
+  // Supabase PostgreSQL requires an encrypted connection.
+  ssl: {
+    rejectUnauthorized: false
   },
 
-  pool: {
-    max: 10,
-    min: 0,
-    idleTimeoutMillis: 30000
-  }
-};
+  max: 10,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 10000
+});
 
-let poolPromise;
+let connectionPromise;
 
 async function getPool() {
-  if (!poolPromise) {
-    poolPromise = new sql.ConnectionPool(config)
-      .connect()
-      .then((pool) => {
-        console.log("SQL Server connected successfully!");
+  if (!process.env.DATABASE_URL) {
+    throw new Error("DATABASE_URL is not configured.");
+  }
+
+  if (!connectionPromise) {
+    connectionPromise = pool.query("SELECT 1")
+      .then(() => {
+        console.log("Supabase PostgreSQL connected successfully!");
         return pool;
       })
       .catch((error) => {
-        poolPromise = null;
+        connectionPromise = null;
         throw error;
       });
   }
 
-  return poolPromise;
+  return connectionPromise;
 }
 
-module.exports = { sql, getPool };
+pool.on("error", (error) => {
+  console.error("Unexpected PostgreSQL pool error:", error);
+});
+
+module.exports = { pool, getPool };

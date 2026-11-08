@@ -1,5 +1,6 @@
+
 const jwt = require("jsonwebtoken");
-const { sql, getPool } = require("../database");
+const { getPool } = require("../database");
 
 async function authenticateToken(req, res, next) {
   const authHeader = req.headers.authorization;
@@ -38,23 +39,20 @@ async function authenticateToken(req, res, next) {
   try {
     const pool = await getPool();
 
-    // Refresh the server-side idle expiry only while the previous session
-    // is still active. An expired or revoked session cannot be revived.
-    const result = await pool.request()
-      .input("SessionId", sql.UniqueIdentifier, decoded.sessionId)
-      .input("UserId", sql.Int, decoded.userId)
-      .query(`
-        UPDATE dbo.Sessions
-        SET LastActivityAt = SYSUTCDATETIME(),
-            ExpiresAt = DATEADD(MINUTE, 15, SYSUTCDATETIME())
-        OUTPUT INSERTED.SessionId
-        WHERE SessionId = @SessionId
-          AND UserId = @UserId
-          AND RevokedAt IS NULL
-          AND ExpiresAt > SYSUTCDATETIME()
-      `);
+    // Refresh the session only if it is still active.
+    const result = await pool.query(
+      `UPDATE sessions
+       SET last_activity_at = NOW(),
+           expires_at = NOW() + INTERVAL '15 minutes'
+       WHERE session_id = $1
+         AND user_id = $2
+         AND revoked_at IS NULL
+         AND expires_at > NOW()
+       RETURNING session_id`,
+      [decoded.sessionId, decoded.userId]
+    );
 
-    if (!result.recordset || result.recordset.length === 0) {
+    if (result.rowCount === 0) {
       return res.status(401).json({
         success: false,
         message: "Your session has expired or has been logged out. Please log in again."
@@ -69,8 +67,10 @@ async function authenticateToken(req, res, next) {
     };
 
     return next();
+
   } catch (error) {
     console.error("Authentication session check error:", error);
+
     return res.status(500).json({
       success: false,
       message: "Unable to verify your session. Please try again."

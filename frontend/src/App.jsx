@@ -1,5 +1,7 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import "./App.css";
+const API_BASE_URL =
+  import.meta.env.VITE_API_URL || "http://127.0.0.1:5000";
 
 const menuItems = [
   { name: "Dashboard", icon: "▦" },
@@ -26,6 +28,19 @@ function App() {
   const [currentUser, setCurrentUser] = useState(null);
   const [isLoading, setIsLoading] = useState(false);
   const [message, setMessage] = useState("");
+  // Password reset state
+  const [authView, setAuthView] = useState(() =>
+  window.location.pathname === "/reset-password"
+    ? "reset"
+    : "login"
+    );
+
+  const [resetEmail, setResetEmail] = useState("");
+  const [resetToken] = useState(
+        () => new URLSearchParams(window.location.search).get("token") || ""
+    );
+  const [newPassword, setNewPassword] = useState("");
+  const [confirmNewPassword, setConfirmNewPassword] = useState("");
 
   // Dashboard state
   const [activePage, setActivePage] = useState("Dashboard");
@@ -35,43 +50,57 @@ function App() {
   const [auditLoading, setAuditLoading] = useState(false);
   const [auditError, setAuditError] = useState("");
   const [uploading, setUploading] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState(0);
   const fileInputRef = useRef(null);
 
   // Load documents visible to the currently authenticated user.
-  const loadDocuments = async (token) => {
-    if (!token) {
-      throw new Error("Please log in again.");
-    }
+const loadDocuments = useCallback(async (token) => {
+  if (!token) {
+    throw new Error("Please log in again.");
+  }
 
-    const response = await fetch("http://127.0.0.1:5000/api/documents", {
-      headers: {
-        Authorization: `Bearer ${token}`,
-      },
-    });
+  const response = await fetch(`${API_BASE_URL}/api/documents`, {
+    cache: "no-store",
+    headers: {
+      Authorization: `Bearer ${token}`,
+    },
+  });
 
-    const data = await response.json();
+  const data = await response.json();
 
-    if (!response.ok || !data.success) {
-      throw new Error(data.message || "Unable to load documents.");
-    }
+  if (!response.ok || !data.success) {
+    throw new Error(data.message || "Unable to load documents.");
+  }
 
-    const formattedDocuments = (data.documents || []).map((doc) => ({
-      id: doc.DocumentId,
-      name: doc.OriginalFileName,
-      ownerId: doc.OwnerId,
-      type: doc.OriginalFileName?.includes(".")
-        ? doc.OriginalFileName.split(".").pop().toUpperCase()
-        : "FILE",
-      size: formatSize(Number(doc.FileSize)),
-      date: doc.UploadedAt
-        ? new Date(doc.UploadedAt).toLocaleDateString()
-        : "",
-      status: "Stored",
-    }));
+  const formattedDocuments = (data.documents || []).map((doc) => ({
+    id: doc.DocumentId,
+    name: doc.OriginalFileName,
+    ownerId: doc.OwnerId,
+    type: doc.OriginalFileName?.includes(".")
+      ? doc.OriginalFileName.split(".").pop().toUpperCase()
+      : "FILE",
+    size: formatSize(Number(doc.FileSize)),
+    date: doc.UploadedAt
+      ? new Date(doc.UploadedAt).toLocaleDateString()
+      : "",
+    status: "Stored",
+  }));
 
-    setDocuments(formattedDocuments);
-    return formattedDocuments;
-  };
+  setDocuments((previousDocuments) => {
+    const unchanged =
+      previousDocuments.length === formattedDocuments.length &&
+      previousDocuments.every((doc, index) =>
+        doc.id === formattedDocuments[index].id &&
+        doc.name === formattedDocuments[index].name &&
+        doc.ownerId === formattedDocuments[index].ownerId &&
+        doc.size === formattedDocuments[index].size
+      );
+
+    return unchanged ? previousDocuments : formattedDocuments;
+  });
+
+  return formattedDocuments;
+}, []);
 
   // Load audit records available to the current user.
   const loadAuditLogs = async (token) => {
@@ -85,7 +114,7 @@ function App() {
 
     try {
       const response = await fetch(
-        "http://127.0.0.1:5000/api/documents/audit",
+        `${API_BASE_URL}/api/documents/audit`,
         {
           headers: {
             Authorization: `Bearer ${token}`,
@@ -126,7 +155,7 @@ function App() {
 
     try {
       const response = await fetch(
-        `http://127.0.0.1:5000/api/documents/${encodeURIComponent(doc.id)}/view`,
+        `${API_BASE_URL}/api/documents/${encodeURIComponent(doc.id)}/view`,
         {
           headers: {
             Authorization: `Bearer ${token}`,
@@ -162,7 +191,7 @@ function App() {
 
     try {
       const response = await fetch(
-        `http://127.0.0.1:5000/api/documents/${encodeURIComponent(doc.id)}/download`,
+        `${API_BASE_URL}/api/documents/${encodeURIComponent(doc.id)}/download`,
         {
           headers: {
             Authorization: `Bearer ${token}`,
@@ -219,7 +248,7 @@ function App() {
 
     try {
       const response = await fetch(
-        `http://127.0.0.1:5000/api/documents/${encodeURIComponent(doc.id)}/share`,
+        `${API_BASE_URL}/api/documents/${encodeURIComponent(doc.id)}/share`,
         {
           method: "POST",
           headers: {
@@ -261,7 +290,7 @@ function App() {
 
     try {
       const response = await fetch(
-        `http://127.0.0.1:5000/api/documents/${encodeURIComponent(doc.id)}`,
+        `${API_BASE_URL}/api/documents/${encodeURIComponent(doc.id)}`,
         {
           method: "DELETE",
           headers: { Authorization: `Bearer ${token}` },
@@ -290,7 +319,7 @@ function App() {
 
     try {
       const response = await fetch(
-        `http://127.0.0.1:5000/api/documents/${encodeURIComponent(doc.id)}/permissions`,
+        `${API_BASE_URL}/api/documents/${encodeURIComponent(doc.id)}/permissions`,
         {
           headers: { Authorization: `Bearer ${token}` },
         }
@@ -339,7 +368,7 @@ function App() {
       if (!confirmed) return;
 
       const revokeResponse = await fetch(
-        `http://127.0.0.1:5000/api/documents/${encodeURIComponent(doc.id)}/permissions/${selected.UserId}`,
+        `${API_BASE_URL}/api/documents/${encodeURIComponent(doc.id)}/permissions/${selected.UserId}`,
         {
           method: "DELETE",
           headers: { Authorization: `Bearer ${token}` },
@@ -371,7 +400,7 @@ function App() {
         : { email, password: passwordPlaceholder };
 
       const response = await fetch(
-        `http://127.0.0.1:5000/api/auth/${endpoint}`,
+        `${API_BASE_URL}/api/auth/${endpoint}`,
         {
           method: "POST",
           headers: {
@@ -419,7 +448,103 @@ function App() {
       setIsLoading(false);
     }
   };
+  // Request a password reset email.
+const handleForgotPassword = async (event) => {
+  event.preventDefault();
+  setMessage("");
+  setIsLoading(true);
 
+  try {
+    const response = await fetch(
+      `${API_BASE_URL}/api/auth/forgot-password`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          email: resetEmail.trim(),
+        }),
+      }
+    );
+
+    const data = await response.json();
+
+    if (!response.ok || !data.success) {
+      throw new Error(data.message || "Unable to process request.");
+    }
+
+    setMessage(data.message);
+  } catch (error) {
+    setMessage(error.message || "Unable to send reset email.");
+  } finally {
+    setIsLoading(false);
+  }
+};
+
+
+// Reset password using the emailed token.
+const handleResetPassword = async (event) => {
+  event.preventDefault();
+  setMessage("");
+
+  if (!resetToken) {
+    setMessage("Invalid or missing password reset link.");
+    return;
+  }
+
+  if (newPassword !== confirmNewPassword) {
+    setMessage("Passwords do not match.");
+    return;
+  }
+
+  if (newPassword.length < 8) {
+    setMessage("Password must contain at least 8 characters.");
+    return;
+  }
+
+  setIsLoading(true);
+
+  try {
+    const response = await fetch(
+      `${API_BASE_URL}/api/auth/reset-password`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          token: resetToken,
+          newPassword,
+        }),
+      }
+    );
+
+    const data = await response.json();
+
+    if (!response.ok || !data.success) {
+      throw new Error(data.message || "Password reset failed.");
+    }
+
+    setNewPassword("");
+    setConfirmNewPassword("");
+    setResetEmail("");
+    setAuthView("login");
+    setIsRegister(false);
+
+    // Remove the reset token from the browser address.
+    window.history.replaceState({}, "", "/");
+
+    setMessage(
+      "Password reset successfully! Please log in using your new password."
+    );
+
+  } catch (error) {
+    setMessage(error.message || "Unable to reset password.");
+  } finally {
+    setIsLoading(false);
+    }
+  };
   const handleLogout = async (reason = "") => {
     const token = sessionStorage.getItem("trustvault_token");
 
@@ -427,7 +552,7 @@ function App() {
     // temporarily unavailable, still complete the local logout.
     if (token) {
       try {
-        await fetch("http://127.0.0.1:5000/api/auth/logout", {
+        await fetch(`${API_BASE_URL}/api/auth/logout`, {
           method: "POST",
           headers: {
             Authorization: `Bearer ${token}`,
@@ -468,7 +593,7 @@ function App() {
     if (!loggedIn) return undefined;
 
     const IDLE_TIMEOUT_MS = 15 * 60 * 1000;
-    const ACTIVITY_SYNC_INTERVAL_MS = 5 * 1000;
+    const ACTIVITY_SYNC_INTERVAL_MS = 60 * 1000;
 
     let idleTimer;
     let lastActivitySync = 0;
@@ -496,7 +621,7 @@ function App() {
         return;
       }
 
-      fetch("http://127.0.0.1:5000/api/auth/activity", {
+      fetch(`${API_BASE_URL}/api/auth/activity`, {
         method: "POST",
         headers: {
           Authorization: `Bearer ${token}`,
@@ -535,53 +660,144 @@ function App() {
       });
     };
   }, [loggedIn]);
+  // Keep document lists synchronized while the user is logged in.
+useEffect(() => {
+  if (!loggedIn) return undefined;
 
-  // Upload selected files to the protected backend endpoint.
-  const handleFileUpload = async (event) => {
-    const files = Array.from(event.target.files || []);
-    if (files.length === 0) return;
+  let refreshInProgress = false;
+
+  const refreshDocuments = async () => {
+    if (refreshInProgress) return;
 
     const token = sessionStorage.getItem("trustvault_token");
-    if (!token) {
-      alert("Please log in again.");
-      event.target.value = "";
-      return;
-    }
+    if (!token) return;
 
-    setUploading(true);
+    refreshInProgress = true;
 
     try {
-      for (const file of files) {
-        const formData = new FormData();
-        formData.append("document", file);
-
-        const response = await fetch(
-          "http://127.0.0.1:5000/api/documents/upload",
-          {
-            method: "POST",
-            headers: {
-              Authorization: `Bearer ${token}`,
-            },
-            body: formData,
-          }
-        );
-
-        const data = await response.json();
-        if (!response.ok || !data.success) {
-          throw new Error(data.message || `Upload failed for ${file.name}.`);
-        }
-      }
-
       await loadDocuments(token);
-      setActivePage("My Documents");
-      alert("Document uploaded successfully!");
     } catch (error) {
-      alert(error.message || "Unable to upload document.");
+      console.error("Automatic document refresh failed:", error);
     } finally {
-      setUploading(false);
-      event.target.value = "";
+      refreshInProgress = false;
     }
   };
+
+  // Refresh immediately after login.
+  refreshDocuments();
+
+  // Check for document changes every 5 seconds.
+  const intervalId = window.setInterval(refreshDocuments, 5000);
+
+  // Refresh when the user returns to this browser tab.
+  const handleVisibilityChange = () => {
+    if (window.document.visibilityState === "visible") {
+      refreshDocuments();
+    }
+  };
+
+  window.document.addEventListener(
+    "visibilitychange",
+    handleVisibilityChange
+  );
+
+  return () => {
+    window.clearInterval(intervalId);
+    window.document.removeEventListener(
+      "visibilitychange",
+      handleVisibilityChange
+    );
+  };
+}, [loggedIn, loadDocuments]);
+
+  // Upload selected files with percentage-based progress.
+const handleFileUpload = async (event) => {
+  const files = Array.from(event.target.files || []);
+  if (files.length === 0) return;
+
+  const token = sessionStorage.getItem("trustvault_token");
+
+  if (!token) {
+    alert("Please log in again.");
+    event.target.value = "";
+    return;
+  }
+
+  setUploading(true);
+  setUploadProgress(0);
+
+  try {
+    for (let i = 0; i < files.length; i++) {
+      const file = files[i];
+      const formData = new FormData();
+      formData.append("file", file);
+
+      await new Promise((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+
+        xhr.open("POST", `${API_BASE_URL}/api/documents/upload`);
+
+        xhr.setRequestHeader("Authorization", `Bearer ${token}`);
+
+        xhr.upload.onprogress = (progressEvent) => {
+          if (progressEvent.lengthComputable) {
+            const currentFileProgress =
+              (progressEvent.loaded / progressEvent.total) * 100;
+
+            const overallProgress =
+              ((i + currentFileProgress / 100) / files.length) * 100;
+
+            setUploadProgress(Math.min(95, Math.round(overallProgress)));
+          }
+        };
+
+        xhr.onload = () => {
+          let data;
+
+          try {
+            data = JSON.parse(xhr.responseText);
+          } catch {
+            reject(new Error("Invalid server response."));
+            return;
+          }
+
+          if (xhr.status < 200 || xhr.status >= 300 || !data.success) {
+            reject(
+              new Error(data.message || `Upload failed for ${file.name}.`)
+            );
+            return;
+          }
+
+          resolve();
+        };
+
+        xhr.onerror = () => {
+          reject(new Error(`Network error while uploading ${file.name}.`));
+        };
+
+        xhr.onabort = () => {
+          reject(new Error(`Upload cancelled for ${file.name}.`));
+        };
+
+        xhr.send(formData);
+      });
+    }
+
+    setUploadProgress(100);
+
+    await loadDocuments(token);
+    await loadAuditLogs(token);
+
+    setActivePage("My Documents");
+    alert("Document uploaded successfully!");
+  } catch (error) {
+    alert(error.message || "Unable to upload document.");
+  } finally {
+    setUploading(false);
+    setUploadProgress(0);
+    event.target.value = "";
+  }
+};
 
   const handleNavigation = (pageName) => {
     setActivePage(pageName);
@@ -649,8 +865,7 @@ function App() {
       </div>
     );
   };
-
-  // Login and registration screen
+  // Login, registration and password recovery screens
   if (!loggedIn) {
     return (
       <div className="app-container">
@@ -675,67 +890,173 @@ function App() {
           </section>
 
           <section className="login-card">
-            <h2>{isRegister ? "Create Account" : "Welcome Back"}</h2>
-            <p>
-              {isRegister
-                ? "Register to get started with TrustVault"
-                : "Login to access your secure documents"}
-            </p>
 
-            <form onSubmit={handleSubmit}>
-              {isRegister && (
-                <input
-                  type="text"
-                  placeholder="Full Name"
-                  value={fullName}
-                  onChange={(event) => setFullName(event.target.value)}
-                  required
-                />
-              )}
+            {authView === "forgot" ? (
+              <>
+                <h2>Forgot Password?</h2>
+                <p>Enter your registered email to receive a password reset link.</p>
 
-              <input
-                type="email"
-                placeholder="Email Address"
-                value={email}
-                onChange={(event) => setEmail(event.target.value)}
-                required
-              />
+                <form onSubmit={handleForgotPassword}>
+                  <input
+                    type="email"
+                    placeholder="Email Address"
+                    value={resetEmail}
+                    onChange={(event) => setResetEmail(event.target.value)}
+                    required
+                  />
 
-              <input
-                type="password"
-                placeholder="Password"
-                value={passwordPlaceholder}
-                onChange={(event) => setPasswordPlaceholder(event.target.value)}
-                minLength={8}
-                required
-              />
+                  <button type="submit" disabled={isLoading}>
+                    {isLoading ? "Please wait..." : "Send Reset Link"}
+                  </button>
+                </form>
 
-              <button type="submit" disabled={isLoading}>
-                {isLoading
-                  ? "Please wait..."
-                  : isRegister
-                    ? "Create Account"
-                    : "Login"}
-              </button>
-            </form>
+                {message && <p className="message">{message}</p>}
 
-            {message && <p className="message">{message}</p>}
+                <p className="switch-text">
+                  Remember your password?
+                  <button
+                    type="button"
+                    className="switch-button"
+                    onClick={() => {
+                      setAuthView("login");
+                      setMessage("");
+                    }}
+                  >
+                    Back to Login
+                  </button>
+                </p>
+              </>
+            ) : authView === "reset" ? (
+              <>
+                <h2>Reset Password</h2>
+                <p>Enter your new password below.</p>
 
-            <p className="switch-text">
-              {isRegister
-                ? "Already have an account?"
-                : "Don't have an account?"}
-              <button
-                type="button"
-                className="switch-button"
-                onClick={() => {
-                  setIsRegister(!isRegister);
-                  setMessage("");
-                }}
-              >
-                {isRegister ? "Login" : "Register"}
-              </button>
-            </p>
+                <form onSubmit={handleResetPassword}>
+                  <input
+                    type="password"
+                    placeholder="New Password"
+                    value={newPassword}
+                    onChange={(event) => setNewPassword(event.target.value)}
+                    minLength={8}
+                    required
+                  />
+
+                  <input
+                    type="password"
+                    placeholder="Confirm New Password"
+                    value={confirmNewPassword}
+                    onChange={(event) =>
+                      setConfirmNewPassword(event.target.value)
+                    }
+                    minLength={8}
+                    required
+                  />
+
+                  <button type="submit" disabled={isLoading}>
+                    {isLoading ? "Please wait..." : "Reset Password"}
+                  </button>
+                </form>
+
+                {message && <p className="message">{message}</p>}
+
+                <p className="switch-text">
+                  <button
+                    type="button"
+                    className="switch-button"
+                    onClick={() => {
+                      setAuthView("login");
+                      setMessage("");
+                      window.history.replaceState({}, "", "/");
+                    }}
+                  >
+                    Back to Login
+                  </button>
+                </p>
+              </>
+            ) : (
+              <>
+                <h2>{isRegister ? "Create Account" : "Welcome Back"}</h2>
+                <p>
+                  {isRegister
+                    ? "Register to get started with TrustVault"
+                    : "Login to access your secure documents"}
+                </p>
+
+                <form onSubmit={handleSubmit}>
+                  {isRegister && (
+                    <input
+                      type="text"
+                      placeholder="Full Name"
+                      value={fullName}
+                      onChange={(event) => setFullName(event.target.value)}
+                      required
+                    />
+                  )}
+
+                  <input
+                    type="email"
+                    placeholder="Email Address"
+                    value={email}
+                    onChange={(event) => setEmail(event.target.value)}
+                    required
+                  />
+
+                  <input
+                    type="password"
+                    placeholder="Password"
+                    value={passwordPlaceholder}
+                    onChange={(event) =>
+                      setPasswordPlaceholder(event.target.value)
+                    }
+                    minLength={8}
+                    required
+                  />
+
+                  <button type="submit" disabled={isLoading}>
+                    {isLoading
+                      ? "Please wait..."
+                      : isRegister
+                        ? "Create Account"
+                        : "Login"}
+                  </button>
+                </form>
+
+                {!isRegister && (
+                  <p className="switch-text">
+                    <button
+                      type="button"
+                      className="switch-button"
+                      onClick={() => {
+                        setAuthView("forgot");
+                        setResetEmail(email);
+                        setMessage("");
+                      }}
+                    >
+                      Forgot Password?
+                    </button>
+                  </p>
+                )}
+
+                {message && <p className="message">{message}</p>}
+
+                <p className="switch-text">
+                  {isRegister
+                    ? "Already have an account?"
+                    : "Don't have an account?"}
+                  <button
+                    type="button"
+                    className="switch-button"
+                    onClick={() => {
+                      setIsRegister(!isRegister);
+                      setAuthView("login");
+                      setMessage("");
+                    }}
+                  >
+                    {isRegister ? "Login" : "Register"}
+                  </button>
+                </p>
+              </>
+            )}
           </section>
         </main>
 
@@ -906,11 +1227,33 @@ function App() {
                 >
                   {uploading ? "Uploading..." : "Choose Files"}
                 </button>
+                {uploading && (
+                <div className="upload-progress-container">
+                <div className="upload-progress-info">
+              <span>Uploading your document...</span>
+              <strong>{uploadProgress}%</strong>
+              </div>
+
+              <div
+              className="upload-progress-track"
+              role="progressbar"
+              aria-valuenow={uploadProgress}
+              aria-valuemin={0}
+              aria-valuemax={100}
+              aria-label="Document upload progress"
+               >
+              <div
+              className="upload-progress-fill"
+              style={{ width: `${uploadProgress}%` }}
+              />
+            </div>
+          </div>
+          )}
               </div>
 
               <p className="upload-note">
-                Uploaded files are stored by the backend. Document details and
-                permissions are recorded in TrustVaultDB.
+                Uploaded files are stored in private Supabase Storage. Document
+details, permissions and audit records are maintained in Supabase PostgreSQL.
               </p>
             </section>
           )}

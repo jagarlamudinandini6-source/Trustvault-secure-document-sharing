@@ -1,21 +1,39 @@
-const documentRoutes = require("./routes/documents");
-const express = require("express");
-const cors = require("cors");
-const authRoutes = require("./routes/auth");
-const authenticateToken = require("./middleware/auth");
 
 require("dotenv").config();
 
-const app = express();
+const express = require("express");
+const cors = require("cors");
 
+const authRoutes = require("./routes/auth");
+const documentRoutes = require("./routes/documents");
+const authenticateToken = require("./middleware/auth");
+const { getPool } = require("./database");
+
+const app = express();
 const PORT = process.env.PORT || 5000;
+
+// Allow local frontend and the configured deployment frontend.
+const allowedOrigins = (
+  process.env.FRONTEND_URL || "http://localhost:5173"
+)
+  .split(",")
+  .map((origin) => origin.trim())
+  .filter(Boolean);
 
 // Middleware
 app.use(cors({
-  origin: "http://localhost:5173"
+  origin: (origin, callback) => {
+    if (!origin || allowedOrigins.includes(origin)) {
+      return callback(null, true);
+    }
+
+    return callback(new Error("Origin not allowed by CORS."));
+  }
 }));
 
-app.use(express.json());
+app.use(express.json({ limit: "1mb" }));
+
+// API routes
 app.use("/api/auth", authRoutes);
 app.use("/api/documents", documentRoutes);
 
@@ -24,7 +42,7 @@ app.get("/", (req, res) => {
   res.send("Welcome to TrustVault Backend API!");
 });
 
-// Health check API
+// Backend health check
 app.get("/api/health", (req, res) => {
   res.json({
     success: true,
@@ -33,22 +51,22 @@ app.get("/api/health", (req, res) => {
   });
 });
 
-const { getPool } = require("./database");
-
+// Supabase PostgreSQL database check
 app.get("/api/db-check", async (req, res) => {
   try {
     const pool = await getPool();
 
-    const result = await pool.request().query(`
-      SELECT DB_NAME() AS databaseName,
-             @@SERVERNAME AS serverName
+    const result = await pool.query(`
+      SELECT
+        current_database() AS "databaseName",
+        current_user AS "databaseUser"
     `);
 
     res.json({
       success: true,
-      message: "TrustVault database connected successfully!",
-      database: result.recordset[0].databaseName,
-      server: result.recordset[0].serverName
+      message: "TrustVault PostgreSQL database connected successfully!",
+      database: result.rows[0].databaseName,
+      databaseUser: result.rows[0].databaseUser
     });
 
   } catch (error) {
@@ -56,12 +74,12 @@ app.get("/api/db-check", async (req, res) => {
 
     res.status(500).json({
       success: false,
-      message: "Database connection failed",
-      error: error.message
+      message: "Database connection failed."
     });
   }
 });
 
+// Protected route
 app.get("/api/protected-check", authenticateToken, (req, res) => {
   res.json({
     success: true,
@@ -69,7 +87,8 @@ app.get("/api/protected-check", authenticateToken, (req, res) => {
     user: req.user
   });
 });
+
 // Start server
 app.listen(PORT, () => {
-  console.log(`TrustVault backend running at http://localhost:${PORT}`);
+  console.log(`TrustVault backend running on port ${PORT}`);
 });
