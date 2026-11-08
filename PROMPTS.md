@@ -112,3 +112,15 @@ Verified document deletion, permission management, audit-log updates, and manual
 
 **Commit link:**  
 https://github.com/jagarlamudinandini6-source/Trustvault-secure-document-sharing/commit/efcf77e09ed224192124ae84c3dad17c2d772c7f
+
+## 2026-11-08 – Upload Progress and Project Improvements
+
+**Prompt:** Improve the TrustVault application, including secure authentication, password reset, document management, Supabase integration, and upload progress feedback.
+
+**Tool Output:** Updated backend and frontend functionality. Implemented XMLHttpRequest-based upload progress tracking, displaying progress up to 95% during transfer and 100% after successful backend confirmation.
+
+**Issue:** Large file uploads appeared to jump directly to 100%.
+
+**Alternative / Solution:** Capped browser-reported upload progress at 95% until the backend confirmed successful storage.
+
+**Commit:** https://github.com/jagarlamudinandini6-source/Trustvault-secure-document-sharing/commit/73989ac
