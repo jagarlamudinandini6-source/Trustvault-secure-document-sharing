@@ -1,6 +1,6 @@
 # TrustVault – AI Prompts and Development Log
 
-This file documents the AI-assisted development process for TrustVault, including prompts, outputs, issues encountered, alternatives considered, and related Git commits.
+This file documents the AI-assisted development process for TrustVault, including prompts, outputs, issues encountered, alternatives considered, testing, and related Git commits.
 
 ## Entry 1 – 2026-11-04: Project Setup and Architecture
 
@@ -9,7 +9,7 @@ This file documents the AI-assisted development process for TrustVault, includin
 **Tool / AI Output:**
 - Selected React and Vite for the frontend.
 - Selected Node.js and Express.js for the backend.
-- Selected Microsoft SQL Server for database storage.
+- Initially selected Microsoft SQL Server for database storage.
 - Planned separate backend routes, middleware, and database configuration.
 
 **Issue encountered:** The development environment and project folder were not initially configured.
@@ -54,7 +54,7 @@ This file documents the AI-assisted development process for TrustVault, includin
 **Prompt:** Implement a real audit trail that records who accessed a document and when, including denied access attempts.
 
 **Tool / AI Output:**
-- Created the AuditLogs database table.
+- Created the audit logging database structure.
 - Added document-related audit events.
 - Implemented an authenticated audit API endpoint.
 - Connected activity logs to the frontend.
@@ -82,45 +82,89 @@ This file documents the AI-assisted development process for TrustVault, includin
 
 **Related commit:** [Initial TrustVault application](https://github.com/jagarlamudinandini6-source/Trustvault-secure-document-sharing/commit/b34e77c)
 
-## Development Transparency
+## Entry 6 – 2026-11-07: Document Deletion, Permission Revocation, and Session Management
 
-- AI assistance was used for implementation guidance, debugging, and testing suggestions.
-- Features and test outcomes are documented based on the actual development process.
-- The related entries point to the real initial application commit because the core implementation was committed together.
-- No separate or fabricated commit history is claimed.
-- Additional improvements and deployment work will be documented as they are completed.
-### 2026-11-07 – Document deletion, permission revocation, and logout improvements
+**Prompt / Request:** Enhance TrustVault so document owners can delete uploaded documents and revoke previously granted VIEW or DOWNLOAD permissions. Also fix manual logout so the page reloads after logout.
 
-**Prompt / Request:**  
-Enhance TrustVault so document owners can delete uploaded documents and revoke previously granted VIEW or DOWNLOAD permissions. Also fix manual logout so the page reloads after logout.
-
-**AI/tool output:**  
+**AI / Tool Output:**
 - Added owner-only document deletion.
 - Added an API to list document permissions.
 - Added an API to revoke a user's document access.
 - Recorded document deletion and access revocation in audit logs.
 - Updated manual logout handling to reload the page after a user clicks Logout.
 
-**Issue encountered:**  
-The manual logout page was not reloading. The Logout button passed a React click event to the logout handler, causing the reload condition to behave incorrectly.
+**Issue encountered:** The manual logout page was not reloading. The Logout button passed a React click event to the logout handler, causing the reload condition to behave incorrectly.
 
-**Alternative / Resolution:**  
-Changed the button handler from `onClick={handleLogout}` to `onClick={() => handleLogout()}`. This allowed manual logout to work while preserving the automatic inactivity timeout behavior.
+**Alternative / Resolution:** Changed the button handler from `onClick={handleLogout}` to `onClick={() => handleLogout()}`. This allowed manual logout to work while preserving the automatic inactivity timeout behavior.
 
-**Testing:**  
-Verified document deletion, permission management, audit-log updates, and manual logout. Automatic 15-minute timeout had also been tested.
+**Testing:** Verified document deletion, permission management, audit-log updates, and manual logout. Automatic 15-minute timeout had also been tested.
 
-**Commit link:**  
-https://github.com/jagarlamudinandini6-source/Trustvault-secure-document-sharing/commit/efcf77e09ed224192124ae84c3dad17c2d772c7f
+**Related commit:** [Document deletion and permission improvements](https://github.com/jagarlamudinandini6-source/Trustvault-secure-document-sharing/commit/efcf77e09ed224192124ae84c3dad17c2d772c7f)
 
-## 2026-11-08 – Upload Progress and Project Improvements
+## Entry 7 – 2026-11-07: Supabase PostgreSQL and Private Storage Migration
+
+**Prompt / Request:** Migrate the TrustVault database and document storage from the initial SQL Server setup to Supabase PostgreSQL and private Supabase Storage.
+
+**AI / Tool Output:**
+- Integrated the Node.js backend with Supabase PostgreSQL using the `pg` package.
+- Migrated application database operations to PostgreSQL.
+- Configured a private Supabase Storage bucket named `trustvault-documents`.
+- Updated document upload and retrieval operations to use private storage.
+- Configured application environment variables for database and Supabase credentials.
+
+**Issue encountered:** The initial database setup used Microsoft SQL Server, while the updated application required PostgreSQL. The direct Supabase database connection also presented an IPv6 connectivity limitation.
+
+**Alternative / Resolution:** Used the Supabase session pooler connection string and updated the backend database configuration to use PostgreSQL.
+
+**Testing:** Verified the backend database connection and tested document upload, retrieval, and sharing with the updated storage configuration.
+
+**Related commit:** [TrustVault security and upload improvements](https://github.com/jagarlamudinandini6-source/Trustvault-secure-document-sharing/commit/73989ac)
+
+## Entry 8 – 2026-11-07: Secure Password Reset
+
+**Prompt / Request:** Implement a secure password reset process using email verification, time-limited tokens, and session revocation.
+
+**AI / Tool Output:**
+- Added password reset request and reset API routes.
+- Generated cryptographically random reset tokens.
+- Stored SHA-256 hashes of reset tokens instead of storing the original tokens.
+- Implemented 15-minute token expiry and single-use validation.
+- Used bcrypt to hash the new password.
+- Revoked existing sessions after a successful password reset.
+- Recorded successful password reset activity in the audit log.
+- Integrated email delivery using Resend.
+
+**Issue encountered:** The initial password reset implementation referenced an audit helper that was not defined in the authentication route.
+
+**Alternative / Resolution:** Replaced the undefined helper call with a direct parameterized database insert into the audit log table.
+
+**Testing:** Verified password reset, successful login using the changed password, session revocation, and the `PASSWORD_RESET` audit event.
+
+**Related commit:** [TrustVault security and upload improvements](https://github.com/jagarlamudinandini6-source/Trustvault-secure-document-sharing/commit/73989ac)
+
+## Entry 9 – 2026-11-08: Upload Progress and Project Improvements
 
 **Prompt:** Improve the TrustVault application, including secure authentication, password reset, document management, Supabase integration, and upload progress feedback.
 
-**Tool Output:** Updated backend and frontend functionality. Implemented XMLHttpRequest-based upload progress tracking, displaying progress up to 95% during transfer and 100% after successful backend confirmation.
+**Tool Output:**
+- Implemented XMLHttpRequest-based upload progress tracking.
+- Added a frontend progress indicator.
+- Displayed progress up to 95% during transfer and 100% after successful backend confirmation.
+- Continued improving the authentication, password reset, and document management experience.
 
-**Issue:** Large file uploads appeared to jump directly to 100%.
+**Issue:** Large file uploads appeared to jump directly to 100% before the backend confirmed successful storage.
 
-**Alternative / Solution:** Capped browser-reported upload progress at 95% until the backend confirmed successful storage.
+**Alternative / Solution:** Capped browser-reported upload progress at 95% until the backend confirmed successful storage. The progress indicator reaches 100% only after successful completion.
 
-**Commit:** https://github.com/jagarlamudinandini6-source/Trustvault-secure-document-sharing/commit/73989ac
+**Testing:** Uploaded documents and verified that the progress percentage increased during transfer and reached 100% after successful backend confirmation.
+
+**Related commit:** [TrustVault security and upload improvements](https://github.com/jagarlamudinandini6-source/Trustvault-secure-document-sharing/commit/73989ac)
+
+## Development Transparency
+
+- AI assistance was used for implementation guidance, debugging, and testing suggestions.
+- Features and test outcomes are documented based on the actual development process.
+- Historical entries retain their original implementation commit references where multiple features were committed together.
+- Later improvements reference the commits that contain those changes.
+- No separate or fabricated commit history is claimed.
+- Deployment and additional production security hardening remain future work.
